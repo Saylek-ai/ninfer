@@ -361,18 +361,25 @@ private:
             return FallbackReason::MalformedStructure;
         }
         const std::string_view name = text_.substr(name_begin, name_end - name_begin);
-        if (std::any_of(call.parameters.begin(), call.parameters.end(),
-                        [&](const RawParameter& existing) { return existing.name == name; })) {
-            return FallbackReason::DuplicateParameter;
-        }
+        const auto existing =
+            std::find_if(call.parameters.begin(), call.parameters.end(),
+                         [&](const RawParameter& candidate) { return candidate.name == name; });
 
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
         if (!find_parameter_close(value_begin, value_end)) {
             return FallbackReason::MalformedStructure;
         }
-        call.parameters.push_back(RawParameter{
-            .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
+        const std::string_view value = text_.substr(value_begin, value_end - value_begin);
+
+        // A repeated name whose value bytes match the first occurrence carries no ambiguity, so the
+        // redundant block is dropped and the first value is kept. A differing value remains an
+        // unrepresentable choice and keeps the atomic fallback.
+        if (existing != call.parameters.end()) {
+            if (existing->value != value) { return FallbackReason::DuplicateParameter; }
+        } else {
+            call.parameters.push_back(RawParameter{.name = name, .value = value});
+        }
         pos = value_end + kParamClose.size();
         return FallbackReason::None;
     }

@@ -607,6 +607,31 @@ int test_name_limits_and_non_strict_omissions() {
     return failures;
 }
 
+int test_identical_duplicate_parameter_coalesces() {
+    const auto contract = contract_for("update_record", Json{{"record_id", Json{{"type", "string"}}},
+                                                             {"dry_run", Json{{"type", "boolean"}}}});
+    const std::string identical = tool_call(
+        "update_record", {{"record_id", "sample-1"}, {"dry_run", "false"}, {"dry_run", "false"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(identical, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "identical duplicate parameter did not produce one structured call");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json, nullptr, false);
+        failures += check(!args.is_discarded() && args.size() == 2 &&
+                              args.at("record_id") == "sample-1" && args.at("dry_run") == false,
+                          "identical duplicate parameter was not coalesced to one argument");
+    }
+
+    const std::string conflicting =
+        tool_call("update_record", {{"dry_run", "false"}, {"dry_run", "true"}});
+    failures += check_rejected(conflicting, contract,
+                               ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+                               "conflicting duplicate parameter was coalesced");
+    return failures;
+}
+
 int test_duplicate_tool_contracts_rejected() {
     const auto definition =
         tool_definition("configure", Json{{"value", Json{{"type", "integer"}}}});
@@ -769,6 +794,7 @@ int main() {
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
     failures += test_name_limits_and_non_strict_omissions();
+    failures += test_identical_duplicate_parameter_coalesces();
     failures += test_duplicate_tool_contracts_rejected();
     failures += test_all_or_nothing_structural_commit();
     failures += test_incremental_valid_and_boolean();
