@@ -85,12 +85,43 @@ void test_placement_follows_contiguous_extents() {
            "an empty run always places and a zero-byte allocation never does");
 }
 
+void test_runs_reserve_as_halving_groups() {
+    // Free extents of 3u and 7u. A run of two 3u pages is reserved as one 6u group in the 7u
+    // extent, leaving 1u there; two 2u pages then find room for only one. Placing the pages
+    // one by one would have fit everything, so the simulation must follow the reservation.
+    FreeExtents free(u, u);
+    free.reset(16 * u);
+    (void)free.take(3 * u);
+    (void)free.take(6 * u);
+    (void)free.take(7 * u);
+    free.insert({0, 3 * u});
+    free.insert({9 * u, 7 * u});
+    expect(free.placeable_count(3 * u) == 3 && free.placeable_count(2 * u) == 4,
+           "page counts are conserved under any grouping of equal pages");
+    expect(!free.can_place(runs(Run{3 * u, 2}, Run{2 * u, 2})) &&
+               free.can_place(runs(Run{2 * u, 2}, Run{3 * u, 2})),
+           "a grouped reservation can leave later runs less room than page-wise placement");
+    const auto refused = free.take_run(Run{8 * u, 1});
+    expect(!refused && free.free_bytes() == 10 * u && free.extents().size() == 2,
+           "a run that cannot be reserved takes nothing");
+    const auto taken = free.take_run(Run{3 * u, 2});
+    expect(taken && *taken == std::vector<FreeExtents::Extent>{{9 * u, 6 * u}} &&
+               free.extents().size() == 2 && free.extents()[1] == FreeExtents::Extent{15 * u, u},
+           "the whole group is reserved first, in the first extent that holds it");
+    const auto halved = free.take_run(Run{2 * u, 2});
+    expect(!halved, "a run halves down to single pages and still fails when one cannot fit");
+    const auto one = free.take_run(Run{2 * u, 1});
+    expect(one && *one == std::vector<FreeExtents::Extent>{{0, 2 * u}} &&
+               free.free_bytes() == 2 * u,
+           "a single page reserves in the first extent that holds it");
+}
 } // namespace
 
 int main() {
     try {
         test_rounding_and_first_fit();
         test_placement_follows_contiguous_extents();
+        test_runs_reserve_as_halving_groups();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

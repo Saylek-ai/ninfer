@@ -187,13 +187,14 @@ std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> check
     return impl_->host_bytes_released(checkpoints);
 }
 
-std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
-}
-
 bool Program::host_can_place(std::span<const HostAllocationRun> runs,
                              std::span<const CheckpointHandle> released) const {
     return impl_->host_can_place(runs, released);
+}
+
+std::optional<std::vector<HostAllocationRun>>
+Program::pause_host_runs(SequenceHandle sequence) const {
+    return impl_->pause_host_runs(sequence);
 }
 
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,

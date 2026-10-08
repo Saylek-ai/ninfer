@@ -6,9 +6,11 @@
 
 namespace ninfer {
 
-// One shape of a Host context write: `count` independent allocations of `bytes` each. The shared
-// arena places every allocation first-fit in one contiguous free extent, so a run fits only when
-// the free extents can hold its allocations, not merely when free bytes add up to its total.
+// One shape of a Host context write: `count` allocations of `bytes` each, a page stride or one
+// StateImage. A run is reserved as the Host KV extent store reserves pages: the whole group
+// first, halving it until a group fits, each group first-fit in one contiguous free extent. So a
+// run fits only when the free extents can hold it that way, not when free bytes add up to its
+// total.
 struct HostAllocationRun {
     std::size_t bytes   = 0;
     std::uint32_t count = 0;

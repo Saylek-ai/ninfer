@@ -996,6 +996,40 @@ struct DemotionBatch {
     }
 };
 
+bool ProgramImpl::reserve_kv_transfers(LogicalKVPageStore& pages,
+                                       std::span<const LogicalKVPageHandle> missing,
+                                       runtime::ContextResourceClass resource,
+                                       std::vector<KVTransfer>& transfers) {
+    if (missing.empty()) { return true; }
+    if (!host_kv_extents) { return false; }
+    std::size_t offset = 0;
+    while (offset < missing.size()) {
+        auto count = missing.size() - offset;
+        std::optional<HostKVExtentReservation> destination;
+        // The arena places each reservation in one contiguous extent. Halving the run until a
+        // reservation fits spreads the pages over the extents the placement check saw.
+        while (count) {
+            auto reservation = host_kv_extents->prepare(pages, missing.subspan(offset, count));
+            if (reservation) {
+                destination.emplace(std::move(*reservation));
+                break;
+            }
+            count /= 2;
+        }
+        if (!destination) { return false; }
+        KVTransfer transfer;
+        transfer.pages       = &pages;
+        transfer.resource    = resource;
+        transfer.drop_device = true;
+        transfer.logical.assign(missing.begin() + offset, missing.begin() + offset + count);
+        transfer.physical = host_kv_extents->device_sources(*destination);
+        transfer.host_destination.emplace(std::move(*destination));
+        transfers.push_back(std::move(transfer));
+        offset += count;
+    }
+    return true;
+}
+
 bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     if (!quote.impl || quote.impl->owner != this || context_transaction_) { return false; }
     const auto& plan = *quote.impl;
@@ -1122,32 +1156,10 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
         } else {
             for (const auto end : plan.page_group_ends) { append_group(end); }
         }
-        if (!missing.empty() && !host_kv_extents) { return false; }
-        std::size_t offset = 0;
-        while (offset < missing.size()) {
-            auto count = missing.size() - offset;
-            std::optional<HostKVExtentReservation> destination;
-            while (count) {
-                auto reservation =
-                    host_kv_extents->prepare(pages, std::span(missing).subspan(offset, count));
-                if (reservation) {
-                    destination.emplace(std::move(*reservation));
-                    break;
-                }
-                count /= 2;
-            }
-            // All destinations and source leases belong to this local transaction until
-            // every component is ready. A failed reservation unwinds without dropping pages.
-            if (!destination) { return false; }
-            KVTransfer transfer;
-            transfer.pages       = &pages;
-            transfer.resource    = plan.resource;
-            transfer.drop_device = true;
-            transfer.logical.assign(missing.begin() + offset, missing.begin() + offset + count);
-            transfer.physical = host_kv_extents->device_sources(*destination);
-            transfer.host_destination.emplace(std::move(*destination));
-            transaction.kv_transfers.push_back(std::move(transfer));
-            offset += count;
+        // All destinations and source leases belong to this local transaction until every
+        // component is ready. A failed reservation unwinds without dropping pages.
+        if (!reserve_kv_transfers(pages, missing, plan.resource, transaction.kv_transfers)) {
+            return false;
         }
         // Complete Host replicas already preserve these contents. Once the entire batch is
         // reserved, release their Device copies synchronously, as for a single demotion.

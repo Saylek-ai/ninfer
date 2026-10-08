@@ -726,7 +726,7 @@ public:
             require(prepared && !prepared->reserved &&
                         prepared->frontier == marked.frontiers.front() &&
                         prepared->shortage == runtime::ContextResourceUsage{.state_slots = 1} &&
-                        prepared->host_bytes > 0,
+                        prepared->host_run.count > 0,
                     "failed capture preparation lost its semantic boundary or physical shortage");
             expect_usage(full, "failed capture preparation retained a physical reservation");
         }
@@ -1653,7 +1653,9 @@ public:
         auto pause_base     = request(2 * kChunk);
         const auto to_pause = bind(pause_base);
         prefill_prefix(to_pause, kChunk);
-        const auto pause_bytes = program_.pause_host_bytes(to_pause);
+        const auto pause_runs  = program_.pause_host_runs(to_pause);
+        const auto pause_bytes = pause_runs ? std::optional(ninfer::total_bytes(*pause_runs))
+                                            : std::optional<std::size_t>{};
         require(pause_bytes && *pause_bytes > 0 && program_.start_pause(to_pause, true),
                 "snapshot fact fixture could not reserve its Host demand");
         auto paused = settle();

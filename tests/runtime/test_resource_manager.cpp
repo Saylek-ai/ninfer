@@ -157,13 +157,13 @@ struct Program {
         host_free.insert({entry.offset, entry.bytes});
     }
 
-    // Reserves a run one allocation at a time, first fit, as the placement check assumes.
+    // Reserves a run as the engine does, one block per contiguous group taken.
     void allocate_blocks(Content& content, Run run) {
         if (!run.count || !run.bytes) { return; }
-        for (std::uint32_t page = 0; page < run.count; ++page) {
-            const auto offset = host_free.take(host_free.allocation_bytes(run.bytes));
-            require(offset.has_value(), "fixture reservation disagreed with its placement check");
-            blocks.push_back({*offset, run.bytes, false});
+        const auto taken = host_free.take_run(run);
+        require(taken.has_value(), "fixture reservation disagreed with its placement check");
+        for (const auto& extent : *taken) {
+            blocks.push_back({extent.offset, extent.bytes, false});
             content.host_blocks.push_back(blocks.size() - 1);
         }
     }
@@ -634,17 +634,19 @@ struct Fixture {
 };
 
 void test_cold_writeback_protects_reused_history() {
+    // The block order puts `cold` next to the free tail, so releasing it alone makes room.
     Fixture f(64);
-    const auto cold     = f.program.add({1}, {f.program.host_block(16)});
-    const auto hot      = f.program.add({2}, {f.program.host_block(32)});
-    const auto incoming = f.program.add({3, 4, 5});
+    const auto hot_block = f.program.host_block(32);
+    const auto cold      = f.program.add({1}, {f.program.host_block(16)});
+    const auto hot       = f.program.add({2}, {hot_block});
+    const auto incoming  = f.program.add({3, 4, 5});
     f.publish(cold);
     f.publish(hot);
     f.publish(incoming);
     f.use_shared(hot);
-    require(!f.cache.host_victims(f.program, 48, incoming),
+    require(!f.cache.host_victims(f.program, run(48), incoming),
             "ordinary writeback sacrificed reused history");
-    const auto victims = f.cache.host_victims(f.program, 32, incoming);
+    const auto victims = f.cache.host_victims(f.program, run(32), incoming);
     require(victims && *victims == std::vector<Handle>{cold},
             "ordinary writeback failed to use permitted cold history");
 }
@@ -659,10 +661,10 @@ void test_host_preflight_counts_aliases_and_has_no_partial_deletion() {
     f.publish(first);
     f.publish(second);
     f.publish(incoming);
-    require(!f.cache.host_victims(f.program, 48, incoming, {}, {&second, 1}),
+    require(!f.cache.host_victims(f.program, run(48), incoming, {}, {&second, 1}),
             "Host preflight ignored a surviving alias");
     require(f.program.released.empty(), "failed preflight deleted history");
-    const auto victims = f.cache.host_victims(f.program, 48, incoming);
+    const auto victims = f.cache.host_victims(f.program, run(48), incoming);
     require(victims && *victims == std::vector<Handle>({first, second}),
             "Host preflight failed to count the last shared reference");
     require(f.cache.erase(f.program, first) && f.program.physical_usage().occupied.host_bytes == 64,
@@ -716,17 +718,23 @@ void test_private_continuation_advances_with_adoption_heat() {
         f.program.add({1, 2, 3, 4}, {f.program.host_block(16)}, Role::Continuation);
     f.cache.publish(f.program, owner, advanced);
     f.cache.finish(f.program, owner, next, 20);
-    require(!f.cache.host_victims(f.program, 32, entrant),
+    require(!f.cache.host_victims(f.program, run(32), entrant),
             "new endpoint lost actual private continuation reuse protection");
     const auto replay = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::InputReplay);
     f.cache.publish(f.program, owner, replay);
-    require(f.cache.retention(owner).reused && !f.cache.host_victims(f.program, 32, entrant),
+    require(f.cache.retention(owner).reused && !f.cache.host_victims(f.program, run(32), entrant),
             "input replay and endpoint did not share their owner's retention priority");
 }
 
 void test_branch_adoption_time_is_independent_of_finish_order() {
-    Fixture f(256);
+    // Either branch's block borders the free gap between them, so releasing either alone makes
+    // room and only the adoption order decides which one goes.
+    Fixture f(64);
     const auto parent   = f.program.add({1, 2}, {f.program.host_block(16)}, Role::Continuation);
+    const auto a_block  = f.program.host_block(16);
+    const auto gap      = f.program.host_block(16, true);
+    const auto b_block  = f.program.host_block(16);
+    f.program.free_block(gap);
     const auto original = f.publish(parent, 42);
     const Base branch{.tokens = {1, 2, 3},
                       .advice = {.update_session_index = false, .session_key = 42}};
@@ -739,8 +747,8 @@ void test_branch_adoption_time_is_independent_of_finish_order() {
     const auto second_used = f.cache.retention(second).last_demand;
     require(first != original && second != original && first != second && first_used < second_used,
             "independent branches did not acquire distinct real adoption times");
-    const auto a = f.program.add({1, 2, 3}, {f.program.host_block(16)}, Role::Continuation);
-    const auto b = f.program.add({1, 2, 4}, {f.program.host_block(16)}, Role::Continuation);
+    const auto a = f.program.add({1, 2, 3}, {a_block}, Role::Continuation);
+    const auto b = f.program.add({1, 2, 4}, {b_block}, Role::Continuation);
     f.cache.publish(f.program, second, b);
     f.cache.finish(f.program, second, branch, 11);
     f.cache.publish(f.program, first, a);
@@ -749,9 +757,8 @@ void test_branch_adoption_time_is_independent_of_finish_order() {
                 f.cache.retention(second).last_demand == second_used &&
                 f.program.valid_checkpoint(parent),
             "late completion fabricated recency or destroyed the independent parent");
-    const auto victims = f.cache.host_victims(f.program, 224, std::nullopt);
-    require(victims && std::find(victims->begin(), victims->end(), a) != victims->end() &&
-                std::find(victims->begin(), victims->end(), parent) == victims->end(),
+    const auto victims = f.cache.host_victims(f.program, run(32), std::nullopt);
+    require(victims && *victims == std::vector<Handle>{a},
             "writeback protection used completion order rather than actual adoption order");
 }
 
@@ -768,7 +775,7 @@ void test_shared_source_does_not_inherit_private_heat() {
     f.cache.finish(f.program, owner, base, 20);
     const auto incoming = f.program.add({9, 8});
     f.publish(incoming);
-    const auto victims = f.cache.host_victims(f.program, 48, incoming);
+    const auto victims = f.cache.host_victims(f.program, run(48), incoming);
     require(victims && *victims == std::vector<Handle>{endpoint},
             "shared adoption failed to protect the shared point independently of its cold child");
 }
@@ -1118,7 +1125,7 @@ void test_forked_hot_records_do_not_bypass_the_soft_capacity_target() {
     f.cache.finish(f.program, owner, branch, 2);
     const auto entrant = f.program.add({9, 8, 7});
     f.publish(entrant);
-    const auto victims = f.cache.host_victims(f.program, 16, entrant);
+    const auto victims = f.cache.host_victims(f.program, run(16), entrant);
     require(victims && *victims == std::vector<Handle>{parent},
             "equal-adoption parent and child bypassed the per-resource protection soft target");
 }
@@ -1139,7 +1146,7 @@ void test_large_hotspot_is_preserved_per_resource_pool() {
     f.publish(entrant);
     f.use_shared(main);
     f.use_shared(host);
-    require(!f.cache.host_victims(f.program, 16, entrant),
+    require(!f.cache.host_victims(f.program, run(16), entrant),
             "a newer Host-only hit demoted the sole Main KV hotspot");
 }
 
@@ -1416,17 +1423,18 @@ void test_fallback_requires_surviving_compatible_earlier_history() {
     const Base smaller{.tokens = tokens(50, 1000)};
     auto admission = f.cache.capture_admission(f.program, 0, smaller, 50);
     auto decision  = f.cache.begin_reclaim(f.program, admission);
-    require(!f.cache.host_victims(f.program, 32, {}, {}, {}, admission, &decision),
+    require(!f.cache.host_victims(f.program, run(32), {}, {}, {}, admission, &decision),
             "joint E/R deletion counted the two removed records as each other's fallback");
     const auto survivor = f.program.add(tokens(100));
     f.publish(survivor);
-    const auto accepted = f.cache.host_victims(f.program, 32, {}, {}, {}, admission, &decision);
+    const auto accepted =
+        f.cache.host_victims(f.program, run(32), {}, {}, {}, admission, &decision);
     require(accepted && accepted->size() == 2 &&
                 std::find(accepted->begin(), accepted->end(), input) != accepted->end() &&
                 std::find(accepted->begin(), accepted->end(), endpoint) != accepted->end(),
             "real independent surviving recovery was not used for marginal-loss admission");
     require(f.cache.erase(f.program, survivor) &&
-                !f.cache.host_victims(f.program, 32, {}, {}, {}, admission, &decision),
+                !f.cache.host_victims(f.program, run(32), {}, {}, {}, admission, &decision),
             "a fixed decision reused recovery value after its fallback was released");
 }
 
@@ -1439,7 +1447,7 @@ void test_optional_capture_does_not_inherit_required_eviction_rights() {
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
                     ninfer::runtime::ReclaimProgress::Blocked &&
-                !f.cache.host_victims(f.program, 64, {}, {}, {}, admission) &&
+                !f.cache.host_victims(f.program, run(64), {}, {}, {}, admission) &&
                 f.program.valid_checkpoint(long_history),
             "optional short capture erased more recovery work than it added");
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
@@ -1457,7 +1465,7 @@ void test_physical_host_alias_uses_all_holders_priority() {
     f.use_shared(hot);
     const Base incoming{.tokens = tokens(100, 1000)};
     const auto admission = f.cache.capture_admission(f.program, 0, incoming, 100);
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission) &&
+    require(!f.cache.host_victims(f.program, run(64), {}, {}, {}, admission) &&
                 f.program.released.empty(),
             "cold Host alias granted permission to remove its hot physical co-owner");
 }
@@ -1507,7 +1515,8 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
     const Base incoming{.tokens = tokens(100)};
     const auto admission    = f.cache.capture_admission(f.program, 0, incoming, 100);
     auto decision           = f.cache.begin_reclaim(f.program, admission);
-    const auto host_victims = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
+    const auto host_victims =
+        f.cache.host_victims(f.program, run(64), {}, {}, {}, admission, &decision);
     require(host_victims && *host_victims == std::vector<Handle>{host},
             "first Host action did not fit optional capture's recovery budget");
     f.cache.commit_host_victims(f.program, *host_victims, decision);
@@ -1525,10 +1534,10 @@ void test_snapshot_revocation_follows_ordinary_history_and_engine_order() {
     f.publish(ordinary);
     f.use_shared(ordinary);
     const std::array snapshots{first, second};
-    const auto one = f.cache.host_victims(f.program, 32, {}, snapshots);
+    const auto one = f.cache.host_victims(f.program, run(32), {}, snapshots);
     require(one && *one == std::vector<Handle>{ordinary},
             "a paused Snapshot was revoked while ordinary Host history could satisfy the request");
-    const auto two = f.cache.host_victims(f.program, 64, {}, snapshots);
+    const auto two = f.cache.host_victims(f.program, run(64), {}, snapshots);
     require(two && *two == std::vector<Handle>({ordinary, first}),
             "Snapshot size or descriptor order overrode the Engine's explicit revocation order");
 }
@@ -1543,7 +1552,7 @@ void test_deeper_survivor_cannot_replace_an_earlier_recovery_point() {
     f.publish(endpoint);
     f.publish(survivor);
     const Base incoming{.tokens = tokens(20, 1000)};
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {},
+    require(!f.cache.host_victims(f.program, run(64), {}, {}, {},
                                   f.cache.capture_admission(f.program, 0, incoming, 20)),
             "a later recurrent state was incorrectly used to recover an earlier input frontier");
 }
@@ -1563,7 +1572,7 @@ void test_inherited_owner_heat_cannot_spend_a_full_other_continuation() {
             "fixture did not inherit actual private adoption evidence");
     const auto admission = f.cache.capture_admission(f.program, owner, next, 2091);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision) &&
+    require(!f.cache.host_victims(f.program, run(64), {}, {}, {}, admission, &decision) &&
                 f.program.valid_checkpoint(other),
             "a new 52-token refinement borrowed owner heat to erase another complete dialogue");
 }
@@ -1580,7 +1589,8 @@ void test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallba
     f.cache.observe_committed(incoming, 101, 32, 1000);
     const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
-    const auto replaced  = f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision);
+    const auto replaced =
+        f.cache.host_victims(f.program, run(64), {}, {}, {}, admission, &decision);
     require(
         replaced && *replaced == std::vector<Handle>{old},
         "a generic system fallback permanently excluded a repeatedly demanded shorter candidate");
@@ -1601,7 +1611,7 @@ void test_old_candidate_demand_cannot_borrow_a_new_owner_epoch() {
     require(f.begin(request, source) == owner, "fixture did not establish newer owner adoption");
     const auto admission = f.cache.capture_admission(f.program, owner, request, 100);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision),
+    require(!f.cache.host_victims(f.program, run(64), {}, {}, {}, admission, &decision),
             "an older exact candidate borrowed newer owner heat to displace a more recent demand");
 }
 
@@ -1810,7 +1820,7 @@ void test_optional_capture_cannot_borrow_a_demotion_sources_heat() {
     const Base incoming{.tokens = tokens(1000, 30000)};
     const auto admission = f.cache.capture_admission(f.program, 0, incoming, 1000, false);
     auto decision        = f.cache.begin_reclaim(f.program, admission);
-    require(!f.cache.host_victims(f.program, 64, {}, {}, {}, admission, &decision),
+    require(!f.cache.host_victims(f.program, run(64), {}, {}, {}, admission, &decision),
             "cold optional capture could directly evict the hot Host history");
     // Deleting source costs 2000 tokens and exceeds this capture's gain. Moving source
     // would cost only the Host victim's 100 tokens, but must not borrow its hotter demand.
@@ -1995,32 +2005,21 @@ void test_unplaceable_host_frees_nothing_and_keeps_the_hot_history() {
 }
 
 void test_host_victims_prefer_the_smaller_sufficient_release() {
-    // Free bytes fall two short of the move's page. One victim frees exactly those two, next to
-    // the free extent; the other four times as much. Either alone makes the page placeable.
-    // Ranking benefit is capped by the deficit, so the smaller release with the smaller loss is
-    // the one taken. The move preserves ten tokens, so both victims are admissible.
+    // Free bytes fall two short of the write. One victim frees exactly those two, next to the
+    // free extent; another frees four times as much. Ranking benefit is capped by the deficit,
+    // so the smaller release with the smaller loss wins, as it did before placement decided room.
     Fixture f(16);
     const auto small = f.program.add({1}, {f.program.host_block(2)});
     const auto gap   = f.program.host_block(6, true);
     const auto large = f.program.add({2, 3, 4}, {f.program.host_block(8)});
     f.program.free_block(gap);
-    for (const auto handle : {small, large}) {
-        f.program.contents[handle.index].device_state = false;
-        f.program.contents[handle.index].main_pages   = 0;
-    }
-    const auto incoming                               = f.program.add(tokens(10, 100));
-    f.program.contents[incoming.index].demotion_bytes = 8;
     f.publish(small);
     f.publish(large);
-    f.publish(incoming);
-    require(!f.program.host_can_place(run(8)) && f.program.host_can_place(run(8), {&small, 1}) &&
+    require(f.program.host_can_place(run(8), {&small, 1}) &&
                 f.program.host_can_place(run(8), {&large, 1}),
-            "either victim alone should make the page placeable");
-    require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
-                ninfer::runtime::ReclaimProgress::Changed,
-            "the move found no Host room");
-    require(f.program.released == std::vector<Handle>{small} &&
-                f.program.demoted == std::vector<Handle>{incoming},
+            "either victim alone should make the write placeable");
+    const auto victims = f.cache.host_victims(f.program, run(8), std::nullopt);
+    require(victims && *victims == std::vector<Handle>{small},
             "placement ranking sacrificed more history than the sufficient small release");
 }
 

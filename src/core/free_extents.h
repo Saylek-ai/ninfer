@@ -101,26 +101,40 @@ public:
         }
     }
 
+    // Takes a run as the Host KV extent store reserves pages: the whole remaining group first,
+    // halving the group until one fits, down to a single allocation. All or nothing.
+    [[nodiscard]] std::optional<std::vector<Extent>> take_run(HostAllocationRun run) {
+        std::vector<Extent> taken;
+        if (run.count == 0) { return taken; }
+        if (allocation_bytes(run.bytes) == 0) { return std::nullopt; }
+        FreeExtents trial       = *this;
+        std::uint32_t remaining = run.count;
+        while (remaining) {
+            std::uint32_t group = remaining;
+            std::optional<std::size_t> offset;
+            std::size_t group_bytes = 0;
+            while (group) {
+                group_bytes = run.bytes > std::numeric_limits<std::size_t>::max() / group
+                                  ? 0
+                                  : allocation_bytes(run.bytes * group);
+                if (group_bytes && (offset = trial.take(group_bytes))) { break; }
+                group /= 2;
+            }
+            if (!offset) { return std::nullopt; }
+            taken.push_back({*offset, group_bytes});
+            remaining -= group;
+        }
+        *this = std::move(trial);
+        return taken;
+    }
+
     // Whether every run can be taken, in order, once the `freed` ranges have returned.
     [[nodiscard]] bool can_place(std::span<const HostAllocationRun> runs,
                                  std::span<const HostRange> freed = {}) const {
-        std::vector<Extent> extents = returned(freed);
+        FreeExtents trial(alignment_, minimum_bytes_);
+        trial.extents_ = returned(freed);
         for (const auto& run : runs) {
-            if (!run.count) { continue; }
-            const std::size_t rounded = allocation_bytes(run.bytes);
-            if (rounded == 0) { return false; }
-            std::uint64_t remaining = run.count;
-            // take() carves from the start of the first extent that fits, so equal-size
-            // allocations fill each extent in address order before moving to the next one.
-            for (auto& extent : extents) {
-                if (!remaining) { break; }
-                const std::uint64_t fits =
-                    std::min<std::uint64_t>(remaining, extent.bytes / rounded);
-                extent.offset += fits * rounded;
-                extent.bytes -= fits * rounded;
-                remaining -= fits;
-            }
-            if (remaining) { return false; }
+            if (!trial.take_run(run)) { return false; }
         }
         return true;
     }
