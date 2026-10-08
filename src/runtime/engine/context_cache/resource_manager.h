@@ -1353,52 +1353,80 @@ private:
             }
         }
         auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
+
+        struct Choice {
+            std::size_t action = 0;
+            std::vector<Handle> combined;
+            std::size_t bytes = 0;
+            ActionRank rank;
+            std::size_t snapshot_order = 0;
+        };
+
+        // Ordinary history is exhausted before Engine-owned paused snapshots, which keep the
+        // Engine's explicit youngest-first order.
+        const auto better = [](const Choice& a, const Choice& b) {
+            return a.snapshot_order < b.snapshot_order ||
+                   (a.snapshot_order == b.snapshot_order && less_rank(a.rank, b.rank));
+        };
+        // A migration must satisfy both its own preservation rights and the optional capture
+        // that requested space. Source heat cannot grant the outer capture permission to erase
+        // unrelated hot Host history.
+        const auto admitted = [&](std::span<const Handle> removed) -> std::optional<ActionFacts> {
+            auto facts = action_facts(program, removed, cursor, evaluation);
+            if (!admits(program, removed, facts, admission, cursor, evaluation) ||
+                !admits(program, removed, facts, cursor.admission, cursor, evaluation)) {
+                return std::nullopt;
+            }
+            return facts;
+        };
+        std::vector<std::vector<Handle>> chosen;
         std::vector<Handle> selected;
         std::size_t released = 0;
         while (!satisfied(selected)) {
-            std::optional<std::size_t> best;
-            std::vector<Handle> best_union;
-            std::size_t best_bytes = 0;
-            ActionRank best_rank;
-            std::size_t best_snapshot_order = 0;
+            // An action that completes placement is preferred over one that only adds bytes,
+            // whatever its rank, so a stalled prefix cannot hide a sufficient alternative.
+            std::optional<Choice> completing, progressing;
             for (std::size_t i = 0; i < actions.size(); ++i) {
-                auto combined = selected;
+                Choice choice{.action = i, .combined = selected};
                 for (const auto handle : actions[i].sources) {
-                    if (!contains(combined, handle)) { combined.push_back(handle); }
+                    if (!contains(choice.combined, handle)) { choice.combined.push_back(handle); }
                 }
-                const auto amount = program.host_bytes_released(combined);
-                if (amount <= released) { continue; }
-                auto facts = action_facts(program, combined, cursor, evaluation);
-                // A migration must satisfy both its own preservation rights and the
-                // optional capture that requested space. Source heat cannot grant the
-                // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
-                    continue;
-                }
-                const auto rank = rank_action(program, combined, facts,
-                                              std::min<std::size_t>(amount, benefit), evaluation);
-                std::size_t snapshot_order = 0;
+                choice.bytes = program.host_bytes_released(choice.combined);
+                if (choice.bytes <= released) { continue; }
+                auto facts = admitted(choice.combined);
+                if (!facts) { continue; }
+                choice.rank = rank_action(program, choice.combined, *facts,
+                                          std::min<std::size_t>(choice.bytes, benefit), evaluation);
                 for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
-                    if (contains(combined, later_snapshots[snapshot])) {
-                        snapshot_order = snapshot + 1;
+                    if (contains(choice.combined, later_snapshots[snapshot])) {
+                        choice.snapshot_order = snapshot + 1;
                     }
                 }
-                // Ordinary history is exhausted before Engine-owned paused snapshots.
-                // Snapshot candidates retain the Engine's explicit youngest-first order.
-                if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
-                    best                = i;
-                    best_union          = std::move(combined);
-                    best_bytes          = amount;
-                    best_rank           = rank;
-                    best_snapshot_order = snapshot_order;
+                auto& slot = satisfied(choice.combined) ? completing : progressing;
+                if (!slot || better(choice, *slot)) { slot = std::move(choice); }
+            }
+            auto& best = completing ? completing : progressing;
+            if (!best) { return std::nullopt; }
+            chosen.push_back(actions[best->action].sources);
+            selected = std::move(best->combined);
+            released = best->bytes;
+            actions.erase(actions.begin() + static_cast<std::ptrdiff_t>(best->action));
+        }
+        // An action taken while placement was still impossible may only have added bytes. Drop
+        // every action the final selection can do without, latest first, while the rest stays
+        // admissible.
+        for (std::size_t index = chosen.size(); index-- > 0 && chosen.size() > 1;) {
+            std::vector<Handle> reduced;
+            for (std::size_t other = 0; other < chosen.size(); ++other) {
+                if (other == index) { continue; }
+                for (const auto handle : chosen[other]) {
+                    if (!contains(reduced, handle)) { reduced.push_back(handle); }
                 }
             }
-            if (!best) { return std::nullopt; }
-            selected = std::move(best_union);
-            released = best_bytes;
-            actions.erase(actions.begin() + *best);
+            if (satisfied(reduced) && admitted(reduced)) {
+                chosen.erase(chosen.begin() + static_cast<std::ptrdiff_t>(index));
+                selected = std::move(reduced);
+            }
         }
         return selected;
     }

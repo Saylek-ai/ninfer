@@ -2023,6 +2023,36 @@ void test_host_victims_prefer_the_smaller_sufficient_release() {
             "placement ranking sacrificed more history than the sufficient small release");
 }
 
+void test_host_victims_do_not_hide_a_placeable_action_behind_a_stalled_prefix() {
+    // Two separated free holes never hold the write. The best-ranked victim only adds a third
+    // such hole; a worse-ranked one frees a contiguous fit. The pair exceeds the capture's
+    // recovery budget, the contiguous victim alone does not: it must be chosen, not the pair
+    // and not nothing.
+    Fixture f(20);
+    const auto hole_a = f.program.host_block(2, true);
+    (void)f.program.host_block(1, true);
+    const auto small = f.program.add({1}, {f.program.host_block(2)});
+    (void)f.program.host_block(1, true);
+    const auto hole_b = f.program.host_block(2, true);
+    (void)f.program.host_block(1, true);
+    const auto large = f.program.add(tokens(9), {f.program.host_block(4)});
+    (void)f.program.host_block(7, true);
+    f.program.free_block(hole_a);
+    f.program.free_block(hole_b);
+    f.publish(small);
+    f.publish(large);
+    const Base incoming{.tokens = tokens(10, 500)};
+    const auto admission = f.cache.capture_admission(f.program, 0, incoming, 10);
+    auto decision        = f.cache.begin_reclaim(f.program, admission);
+    require(!f.program.host_can_place(run(4), {&small, 1}) &&
+                f.program.host_can_place(run(4), {&large, 1}),
+            "fixture holes should admit only the contiguous victim's release");
+    const auto victims =
+        f.cache.host_victims(f.program, run(4), std::nullopt, {}, {}, admission, &decision);
+    require(victims && *victims == std::vector<Handle>{large},
+            "a stalled best-ranked prefix hid the admissible placeable action");
+}
+
 int main() {
     try {
         test_demotion_competes_with_its_actual_host_recovery_loss();
@@ -2040,6 +2070,7 @@ int main() {
         test_fragmented_host_evicts_a_victim_and_completes_the_demotion();
         test_unplaceable_host_frees_nothing_and_keeps_the_hot_history();
         test_host_victims_prefer_the_smaller_sufficient_release();
+        test_host_victims_do_not_hide_a_placeable_action_behind_a_stalled_prefix();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();
