@@ -1,5 +1,6 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 
+#include "core/free_extents.h"
 #include "core/host_placement.h"
 
 #include <algorithm>
@@ -87,9 +88,14 @@ struct Program {
         Role role = Role::SharedPrefix;
     };
 
+    // One allocation of the fixture's Host space. A block the fixture itself holds (external
+    // reference) stays until free_block(); a block contents hold returns when its last alive
+    // holder is released, as the engine's typed pools return theirs.
     struct HostBlock {
+        std::size_t offset;
         std::size_t bytes;
         bool external_reference;
+        bool freed = false;
     };
 
     struct Metadata {
@@ -121,13 +127,65 @@ struct Program {
     std::uint32_t main_capacity    = 1024;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
-    // Free Host bytes split into holes none of these tests' allocations fit in; the remaining
-    // free bytes form one usable extent, which deleted blocks return to.
-    std::vector<std::size_t> host_fragments;
+    // The arena's own placement over the fixture's Host space, byte-granular. Blocks are taken
+    // from and returned to it, so a test sees the fragmentation its allocations produce.
+    ninfer::FreeExtents host_free{1, 1};
 
     std::size_t host_block(std::size_t bytes, bool external_reference = false) {
-        blocks.push_back({bytes, external_reference});
+        const auto offset = host_free.take(host_free.allocation_bytes(bytes));
+        require(offset.has_value(), "fixture exceeded its physical Host capacity");
+        blocks.push_back({*offset, bytes, external_reference});
         return blocks.size() - 1;
+    }
+
+    // Returns a fixture-held block to the free extents; later allocations may land there.
+    void free_block(std::size_t block) {
+        auto& entry = blocks.at(block);
+        require(entry.external_reference && !entry.freed, "fixture freed a block contents hold");
+        entry.external_reference = false;
+        entry.freed              = true;
+        host_free.insert({entry.offset, entry.bytes});
+    }
+
+    void release_unreferenced_block(std::size_t block) {
+        auto& entry = blocks.at(block);
+        if (entry.freed || entry.external_reference) { return; }
+        for (const auto& content : contents) {
+            if (references(content, block)) { return; }
+        }
+        entry.freed = true;
+        host_free.insert({entry.offset, entry.bytes});
+    }
+
+    // Reserves a run one allocation at a time, first fit, as the placement check assumes.
+    void allocate_blocks(Content& content, Run run) {
+        if (!run.count || !run.bytes) { return; }
+        for (std::uint32_t page = 0; page < run.count; ++page) {
+            const auto offset = host_free.take(host_free.allocation_bytes(run.bytes));
+            require(offset.has_value(), "fixture reservation disagreed with its placement check");
+            blocks.push_back({*offset, run.bytes, false});
+            content.host_blocks.push_back(blocks.size() - 1);
+        }
+    }
+
+    // The blocks deleting `victims` frees: every alive holder is an evictable victim.
+    [[nodiscard]] std::vector<std::size_t> released_blocks(std::span<const Handle> victims) const {
+        std::vector<std::size_t> result;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            if (blocks[block].external_reference || blocks[block].freed) { continue; }
+            bool referenced = false;
+            bool survives   = false;
+            for (std::uint32_t index = 0; index < contents.size(); ++index) {
+                if (!references(contents[index], block)) { continue; }
+                referenced = true;
+                if (!contents[index].evictable ||
+                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
+                    survives = true;
+                }
+            }
+            if (referenced && !survives) { result.push_back(block); }
+        }
+        return result;
     }
 
     Handle add(Key tokens, std::vector<std::size_t> host_blocks = {},
@@ -135,8 +193,6 @@ struct Program {
         const Handle handle{static_cast<std::uint32_t>(contents.size())};
         contents.push_back({std::move(tokens), std::move(host_blocks)});
         contents.back().role = role;
-        require(physical_usage().occupied.host_bytes <= host_capacity,
-                "fixture exceeded its physical Host capacity");
         return handle;
     }
 
@@ -203,57 +259,18 @@ struct Program {
 
     [[nodiscard]] std::size_t host_bytes_released(std::span<const Handle> victims) const {
         std::size_t bytes = 0;
-        for (std::size_t block = 0; block < blocks.size(); ++block) {
-            if (blocks[block].external_reference) { continue; }
-            bool referenced = false;
-            bool survives   = false;
-            for (std::uint32_t index = 0; index < contents.size(); ++index) {
-                if (!references(contents[index], block)) { continue; }
-                referenced = true;
-                if (!contents[index].evictable ||
-                    std::find(victims.begin(), victims.end(), Handle{index}) == victims.end()) {
-                    survives = true;
-                }
-            }
-            if (referenced && !survives) { bytes += blocks[block].bytes; }
-        }
+        for (const auto block : released_blocks(victims)) { bytes += blocks[block].bytes; }
         return bytes;
     }
 
-    [[nodiscard]] std::vector<std::size_t> host_holes(std::span<const Handle> victims) const {
-        std::size_t fragmented = 0;
-        for (const auto hole : host_fragments) { fragmented += hole; }
-        const auto occupied = physical_usage().occupied.host_bytes;
-        require(occupied + fragmented <= host_capacity, "fixture fragments exceed free Host bytes");
-        std::vector<std::size_t> holes{host_capacity - occupied - fragmented +
-                                       host_bytes_released(victims)};
-        holes.insert(holes.end(), host_fragments.begin(), host_fragments.end());
-        return holes;
-    }
-
-    // First-fit over the holes, as the arena places: a run fits only when its allocations do.
+    // The arena's placement over the fixture's free extents once the victims' blocks return.
     [[nodiscard]] bool host_can_place(std::span<const Run> runs,
                                       std::span<const Handle> victims = {}) const {
-        auto holes = host_holes(victims);
-        for (const auto& run : runs) {
-            if (!run.count) { continue; }
-            if (!run.bytes) { return false; }
-            std::uint64_t remaining = run.count;
-            for (auto& hole : holes) {
-                if (!remaining) { break; }
-                const auto fits = std::min<std::uint64_t>(remaining, hole / run.bytes);
-                hole -= fits * run.bytes;
-                remaining -= fits;
-            }
-            if (remaining) { return false; }
+        std::vector<ninfer::HostRange> freed;
+        for (const auto block : released_blocks(victims)) {
+            freed.push_back({blocks[block].offset, blocks[block].bytes});
         }
-        return true;
-    }
-
-    [[nodiscard]] std::uint64_t placeable(std::size_t bytes) const {
-        std::uint64_t count = 0;
-        for (const auto hole : host_holes({})) { count += hole / bytes; }
-        return count;
+        return host_free.can_place(runs, freed);
     }
 
     [[nodiscard]] bool valid_checkpoint(Handle handle) const {
@@ -265,6 +282,7 @@ struct Program {
         if (!content.alive || !content.evictable || content.release_blocked) { return false; }
         content.alive = false;
         released.push_back(handle);
+        for (const auto block : content.host_blocks) { release_unreferenced_block(block); }
         return true;
     }
 
@@ -405,7 +423,8 @@ struct Program {
                 const auto bytes = *contents.at(handle.index).demotion_bytes;
                 require(!combined.host_run.count || combined.host_run.bytes == bytes,
                         "fixture batch mixed page sizes");
-                const auto room = bytes ? placeable(bytes) - combined.host_run.count : remaining;
+                const auto room =
+                    bytes ? host_free.placeable_count(bytes) - combined.host_run.count : remaining;
                 const auto take = static_cast<std::uint32_t>(
                     std::min<std::uint64_t>(std::min(remaining, pages), room));
                 if (take) {
@@ -546,18 +565,14 @@ struct Program {
         if (!host_can_place(std::span(&plan.host_run, 1), {})) { return false; }
         if (!plan.main_parts.empty()) {
             for (const auto& [handle, pages] : plan.main_parts) {
-                auto& content    = contents.at(handle.index);
-                const auto bytes = *content.demotion_bytes * pages;
-                if (bytes) { content.host_blocks.push_back(host_block(bytes)); }
+                auto& content = contents.at(handle.index);
+                allocate_blocks(content, {*content.demotion_bytes, pages});
                 content.main_pages -= pages;
                 demoted.push_back(handle);
             }
         } else {
             auto& content = contents.at(plan.handle.index);
-            if (plan.host_run.count) {
-                content.host_blocks.push_back(
-                    host_block(plan.host_run.bytes * plan.host_run.count));
-            }
+            allocate_blocks(content, plan.host_run);
             if (plan.released.state_slots) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
@@ -583,7 +598,9 @@ struct Fixture {
 
     explicit Fixture(std::size_t capacity)
         : program{.host_capacity = capacity},
-          cache(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}}) {}
+          cache(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}}) {
+        program.host_free.reset(capacity);
+    }
 
     Cache::SourceChoice source(const Base& base, std::optional<Handle> desired,
                                std::optional<Token> resume = {}) {
@@ -1926,16 +1943,20 @@ void test_fragmented_host_evicts_a_victim_and_completes_the_demotion() {
     // Free Host bytes exceed the move's need, but no single hole holds one page: the planner
     // must take a victim first, then the move reserves in the space that victim returns.
     Fixture f(32);
-    const auto victim                             = f.program.add({1}, {f.program.host_block(16)});
+    const auto gap_before = f.program.host_block(6, true);
+    const auto victim     = f.program.add({1}, {f.program.host_block(16)});
+    (void)f.program.host_block(4, true);
+    const auto gap_after = f.program.host_block(6, true);
+    f.program.free_block(gap_before);
+    f.program.free_block(gap_after);
     f.program.contents[victim.index].device_state = false;
     f.program.contents[victim.index].main_pages   = 0;
     const auto incoming                           = f.program.add({2, 3});
     f.program.contents[incoming.index].demotion_bytes = 8;
     f.publish(victim);
     f.publish(incoming);
-    f.program.host_fragments = {6, 6, 4};
-    require(!f.program.host_can_place(run(8)) &&
-                f.program.physical_usage().occupied.host_bytes == 16,
+    require(f.program.host_free.free_bytes() == 12 && !f.program.host_can_place(run(8)) &&
+                f.program.physical_usage().occupied.host_bytes == 20,
             "fixture free bytes should exceed the need while no hole fits it");
     require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
                 ninfer::runtime::ReclaimProgress::Changed,
@@ -1943,7 +1964,7 @@ void test_fragmented_host_evicts_a_victim_and_completes_the_demotion() {
     require(f.program.released == std::vector<Handle>{victim} &&
                 f.program.demoted == std::vector<Handle>{incoming} &&
                 f.program.valid_checkpoint(incoming) &&
-                f.program.physical_usage().occupied.host_bytes == 8,
+                f.program.physical_usage().occupied.host_bytes == 12,
             "planner did not evict the cold victim and move the source in one decision");
 }
 
@@ -1951,7 +1972,12 @@ void test_unplaceable_host_frees_nothing_and_keeps_the_hot_history() {
     // Nothing admissible can make the move placeable: the Host tier stays as it is, and the
     // Device shortage is met by the planner's next action, the release of the cold source.
     Fixture f(32);
-    const auto hot                             = f.program.add({1}, {f.program.host_block(16)});
+    const auto gap_before = f.program.host_block(6, true);
+    const auto hot        = f.program.add({1}, {f.program.host_block(16)});
+    (void)f.program.host_block(4, true);
+    const auto gap_after = f.program.host_block(6, true);
+    f.program.free_block(gap_before);
+    f.program.free_block(gap_after);
     f.program.contents[hot.index].device_state = false;
     f.program.contents[hot.index].main_pages   = 0;
     const auto incoming                        = f.program.add({2, 3});
@@ -1959,24 +1985,25 @@ void test_unplaceable_host_frees_nothing_and_keeps_the_hot_history() {
     f.publish(hot);
     f.publish(incoming);
     f.use_shared(hot);
-    f.program.host_fragments = {6, 6, 4};
     require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
                 ninfer::runtime::ReclaimProgress::Changed,
             "device shortage was not met when the Host tier could not take the source");
     require(f.program.released == std::vector<Handle>{incoming} && f.program.demoted.empty() &&
                 f.program.valid_checkpoint(hot) &&
-                f.program.physical_usage().occupied.host_bytes == 16,
+                f.program.physical_usage().occupied.host_bytes == 20,
             "an unplaceable move deleted hot Host history or left the shortage unmet");
 }
 
 void test_host_victims_prefer_the_smaller_sufficient_release() {
-    // Free bytes fall two short of the move's page. One victim frees exactly those two, the
-    // other four times as much; either alone makes the page placeable. Ranking benefit is
-    // capped by the deficit, so the smaller release with the smaller loss is the one taken.
-    // The move preserves ten tokens, so both victims are admissible and only ranking decides.
+    // Free bytes fall two short of the move's page. One victim frees exactly those two, next to
+    // the free extent; the other four times as much. Either alone makes the page placeable.
+    // Ranking benefit is capped by the deficit, so the smaller release with the smaller loss is
+    // the one taken. The move preserves ten tokens, so both victims are admissible.
     Fixture f(16);
     const auto small = f.program.add({1}, {f.program.host_block(2)});
+    const auto gap   = f.program.host_block(6, true);
     const auto large = f.program.add({2, 3, 4}, {f.program.host_block(8)});
+    f.program.free_block(gap);
     for (const auto handle : {small, large}) {
         f.program.contents[handle.index].device_state = false;
         f.program.contents[handle.index].main_pages   = 0;
