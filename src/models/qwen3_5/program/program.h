@@ -1,4 +1,5 @@
 #pragma once
+#include "core/host_placement.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -187,7 +188,9 @@ struct BindingReservation {
 
 struct ContextDemotion {
     std::vector<CheckpointHandle> sources;
-    std::size_t host_bytes = 0;
+    // New Host allocations this move must reserve: `count` allocations of `bytes` each, a page
+    // stride or one StateImage. Zero count means every source already has its Host copy.
+    HostAllocationRun host_run;
     runtime::ContextResourceUsage released;
     std::shared_ptr<const detail::DemotionPlan> impl;
 };
@@ -432,6 +435,10 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    // Whether the arena can place every run once this fixed set is deleted. Placement in
+    // contiguous free extents decides Host room; free bytes alone do not.
+    [[nodiscard]] bool host_can_place(std::span<const HostAllocationRun> runs,
+                                      std::span<const CheckpointHandle> released = {}) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
