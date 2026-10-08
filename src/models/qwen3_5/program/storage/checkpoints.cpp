@@ -387,7 +387,8 @@ bool ProgramImpl::host_can_place(std::span<const HostAllocationRun> runs,
     return host_context_arena->can_place(runs, ranges);
 }
 
-std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {
+std::optional<std::vector<HostAllocationRun>>
+ProgramImpl::pause_host_runs(SequenceHandle handle) const {
     if (context_transaction_ || pending_transaction_ || !valid_sequence(handle) ||
         !host_context_arena) {
         return std::nullopt;
@@ -407,25 +408,28 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
             if (item.token_begin < frontier && frontier < item.token_end) { return std::nullopt; }
         }
     }
-    std::size_t bytes = state_store->host_resident(sequence.state.read)
-                            ? 0
-                            : state_images->host_layout().image_bytes;
-    const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+    // Runs follow prepare_backup's reservation order: the StateImage, then Main pages, then
+    // backend pages, each KV pool as page-granular allocations.
+    std::vector<HostAllocationRun> runs;
+    if (!state_store->host_resident(sequence.state.read)) {
+        runs.push_back({state_images->host_layout().image_bytes, 1});
+    }
+    const auto count = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                            KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
         const auto required = kv_pages_for_frontier(target);
-        const auto stride   = (&pages == text_kv_pages.get() ? text_host_kv_page_stride
-                                                              : backend_host_kv_page_stride);
+        HostAllocationRun run{host_kv_page_stride(pages), 0};
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
             const auto page = addresses.logical_page(address, i);
             // Deactivation removes this request's active reference. Other resident readers
             // keep their Device replica, so those pages need no new Host allocation.
             if (!pages.host_resident(page) && pages.active_address_references(page) <= 1) {
-                bytes += stride;
+                ++run.count;
             }
         }
         // Masked-draft normalization can append accepted features before snapshot capture.
-        if (required > mapped) { bytes += static_cast<std::size_t>(required - mapped) * stride; }
+        if (required > mapped) { run.count += required - mapped; }
+        if (run.count) { runs.push_back(run); }
     };
     count(*text_kv_addresses, *text_kv_pages, sequence.kv->text, sequence.text_kv_valid);
     if (sequence.kv->backend) {
@@ -434,7 +438,7 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
                                  : backend_kv_valid(sequence);
         count(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend, backend);
     }
-    return bytes;
+    return runs;
 }
 
 std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle> excluded,

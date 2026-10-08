@@ -86,9 +86,10 @@ public:
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
-    // Whether every run fits first-fit, in order, into the free extents left once the `freed`
-    // ranges have returned. This runs the allocator's own placement without taking anything;
-    // placement, not the free byte total, decides whether a write can reserve.
+    // Whether every run can be reserved, in order, once the `freed` ranges have returned. This
+    // runs the allocator's own placement without taking anything: contiguous first fit, a run
+    // reserved as whole groups that halve until one fits. Placement, not the free byte total,
+    // decides whether a write can reserve.
     [[nodiscard]] bool can_place(std::span<const HostAllocationRun> runs,
                                  std::span<const HostRange> freed = {}) const;
     // How many allocations of `bytes` the current free extents hold, filling each in order.

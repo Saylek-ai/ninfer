@@ -71,10 +71,7 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
     }
     const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                              KVAddressSpaceHandle address, runtime::ContextResourceClass resource) {
-        KVTransfer transfer;
-        transfer.pages       = &pages;
-        transfer.resource    = resource;
-        transfer.drop_device = true;
+        std::vector<LogicalKVPageHandle> missing;
         for (std::uint32_t i = 0; i < addresses.mapped_pages(address); ++i) {
             const auto page = addresses.logical_page(address, i);
             if (!pages.device_resident(page) ||
@@ -84,18 +81,12 @@ bool ProgramImpl::prepare_backup(ContextTransaction& tx, CheckpointState& record
             if (pages.host_resident(page)) {
                 if (!pages.drop_device_replica(page)) { return false; }
             } else {
-                transfer.logical.push_back(page);
+                missing.push_back(page);
             }
         }
-        if (!transfer.logical.empty()) {
-            auto destination =
-                host_kv_extents ? host_kv_extents->prepare(pages, transfer.logical) : std::nullopt;
-            if (destination) { transfer.host_destination.emplace(std::move(*destination)); }
-            if (!transfer.host_destination) { return false; }
-            transfer.physical = host_kv_extents->device_sources(*transfer.host_destination);
-        }
-        tx.kv_transfers.push_back(std::move(transfer));
-        return true;
+        // Page runs are reserved as a demotion's are: a run the arena cannot place contiguously
+        // is halved, so a snapshot fits whenever the placement check said it would.
+        return reserve_kv_transfers(pages, missing, resource, tx.kv_transfers);
     };
     if (!collect(*text_kv_addresses, *text_kv_pages, record.kv->text,
                  runtime::ContextResourceClass::MainKV)) {

@@ -288,7 +288,8 @@ public:
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
     [[nodiscard]] bool host_can_place(std::span<const HostAllocationRun> runs,
                                       std::span<const CheckpointHandle> released) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    [[nodiscard]] std::optional<std::vector<HostAllocationRun>>
+    pause_host_runs(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);
@@ -516,6 +517,12 @@ public:
                            DeviceKVPageHandle destination, runtime::ContextResourceClass);
     void publish_context_transfers(ContextTransaction&);
     [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
+    // Reserves Host destinations for `missing` pages as contiguous page runs, halving a run the
+    // arena cannot place until it fits; one transfer per reserved run.
+    [[nodiscard]] bool reserve_kv_transfers(LogicalKVPageStore&,
+                                            std::span<const LogicalKVPageHandle> missing,
+                                            runtime::ContextResourceClass,
+                                            std::vector<KVTransfer>&);
     [[nodiscard]] std::size_t host_kv_page_stride(const LogicalKVPageStore&) const noexcept;
     // Visits the Host replicas that deleting this fixed set frees, physical sharing counted once.
     // False when the set is not releasable, in which case deleting it frees nothing.

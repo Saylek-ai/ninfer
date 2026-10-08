@@ -369,7 +369,9 @@ struct CapturePreparation {
     std::uint32_t frontier = 0;
     bool reserved          = false;
     runtime::ContextResourceUsage shortage;
-    std::size_t host_bytes = 0;
+    // The Host allocation that lets a StateImage move aside for this capture when the Device
+    // state pool is full.
+    HostAllocationRun host_run;
 };
 enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
 
@@ -439,7 +441,9 @@ public:
     // contiguous free extents decides Host room; free bytes alone do not.
     [[nodiscard]] bool host_can_place(std::span<const HostAllocationRun> runs,
                                       std::span<const CheckpointHandle> released = {}) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
+    // The Host allocations a snapshot of this sequence reserves, in reservation order.
+    [[nodiscard]] std::optional<std::vector<HostAllocationRun>>
+    pause_host_runs(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
                            std::optional<SequenceHandle> pending_backup = std::nullopt);

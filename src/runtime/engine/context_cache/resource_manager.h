@@ -497,18 +497,17 @@ public:
         return cursor;
     }
 
+    // The victims whose deletion lets every run be placed, in reclaim order; an empty set when
+    // the runs already fit, nullopt when no admissible set makes them fit.
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims(Program& program, std::size_t bytes, std::optional<Handle> incoming,
-                 std::span<const Handle> later_snapshots = {},
-                 std::span<const Handle> excluded        = {},
-                 std::optional<Admission> admission      = std::nullopt,
+    host_victims(Program& program, std::span<const HostAllocationRun> runs,
+                 std::optional<Handle> incoming, std::span<const Handle> later_snapshots = {},
+                 std::span<const Handle> excluded   = {},
+                 std::optional<Admission> admission = std::nullopt,
                  const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
         prune(program);
         Evaluation evaluation;
-        const auto usage = program.physical_usage();
-        if (bytes > usage.capacity.host_bytes) { return std::nullopt; }
-        const auto free = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const HostNeed need{.shortage = bytes > free ? bytes - free : 0};
+        const HostNeed need{.runs = runs};
         if (decision) {
             return host_victims_in_order(program, need, incoming, later_snapshots, excluded,
                                          decision->admission, *decision, evaluation);
