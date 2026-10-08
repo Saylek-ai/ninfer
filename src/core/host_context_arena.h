@@ -1,13 +1,13 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/free_extents.h"
 #include "core/host_placement.h"
 
 #include <cstddef>
 #include <optional>
 #include <span>
 #include <utility>
-#include <vector>
 
 namespace ninfer {
 
@@ -65,7 +65,9 @@ public:
 
     [[nodiscard]] std::size_t capacity_bytes() const noexcept { return capacity_bytes_; }
 
-    [[nodiscard]] std::size_t minimum_allocation_bytes() const noexcept { return minimum_bytes_; }
+    [[nodiscard]] std::size_t minimum_allocation_bytes() const noexcept {
+        return free_.minimum_bytes();
+    }
 
     [[nodiscard]] std::size_t occupied_bytes() const noexcept { return occupied_bytes_; }
 
@@ -85,8 +87,8 @@ public:
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
     // Whether every run fits first-fit, in order, into the free extents left once the `freed`
-    // ranges have returned. Placement, not the free byte total, decides whether a write can
-    // reserve; this is the same walk allocate() takes, without taking anything.
+    // ranges have returned. This runs the allocator's own placement without taking anything;
+    // placement, not the free byte total, decides whether a write can reserve.
     [[nodiscard]] bool can_place(std::span<const HostAllocationRun> runs,
                                  std::span<const HostRange> freed = {}) const;
     // How many allocations of `bytes` the current free extents hold, filling each in order.
@@ -100,24 +102,15 @@ public:
 private:
     friend class HostContextAllocation;
 
-    struct FreeExtent {
-        std::size_t offset = 0;
-        std::size_t bytes  = 0;
-    };
-
-    [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
-    [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
-    static void insert_free_extent(std::vector<FreeExtent>& extents, FreeExtent extent);
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
 
     std::optional<PinnedHostBuffer> backing_;
     std::size_t capacity_bytes_      = 0;
-    std::size_t minimum_bytes_       = 0;
     std::size_t occupied_bytes_      = 0;
     std::size_t reserved_bytes_      = 0;
     std::size_t peak_occupied_bytes_ = 0;
     std::size_t allocation_count_    = 0;
-    std::vector<FreeExtent> free_extents_;
+    FreeExtents free_;
 };
 
 } // namespace ninfer
