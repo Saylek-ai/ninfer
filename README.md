@@ -13,6 +13,12 @@
 > | Accept byte-identical duplicate tool parameters | [#244](https://github.com/Neroued/ninfer/issues/244) | `fix/244-duplicate-params` |
 >
 > Based on upstream `81c8ce09`. Releases are tagged `saylek-<upstream sha>-<n>`.
+>
+> Container: every commit on `saylek` and every `saylek-*` tag is built from git by
+> [`container.yml`](.github/workflows/container.yml) and published as `ghcr.io/saylek-ai/ninfer:<commit or tag>`
+> with a build provenance attestation. It holds `ninfer-serve` and its runtime libraries; FFmpeg and the other
+> libraries are Debian 13 packages (sources at sources.debian.org).
+> `docker run --gpus all -p 8080:8080 -v /path/to/models:/models ghcr.io/saylek-ai/ninfer:<tag> /models/<artifact>.ninfer --host 0.0.0.0`
 > Report NInfer issues that are not about these fixes upstream.
 
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
