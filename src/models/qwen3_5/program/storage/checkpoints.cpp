@@ -268,7 +268,14 @@ runtime::ContextResourceUsage ProgramImpl::snapshot_resources(const ResumeState&
     return checkpoint_summary(*paused.impl_->snapshot).evictable_resources;
 }
 
-std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles) const {
+std::size_t ProgramImpl::host_kv_page_stride(const LogicalKVPageStore& pages) const noexcept {
+    return &pages == text_kv_pages.get() ? text_host_kv_page_stride : backend_host_kv_page_stride;
+}
+
+bool ProgramImpl::visit_host_released(
+    std::span<const CheckpointHandle> handles,
+    const std::function<void(StateImageHandle)>& on_state,
+    const std::function<void(const LogicalKVPageStore&, LogicalKVPageHandle)>& on_page) const {
     struct StateReferences {
         StateImageHandle state;
         std::uint32_t references = 0;
@@ -295,7 +302,7 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
         }
     };
     for (const auto handle : handles) {
-        if (!checkpoint_releasable(*this, handle)) { return 0; }
+        if (!checkpoint_releasable(*this, handle)) { return false; }
         if (!records.insert(handle.index).second) { continue; }
         const auto& record = checkpoint(handle);
         auto& state        = states[state_store->descriptor_index(record.state)];
@@ -325,16 +332,15 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
                     backend);
         }
     }
-    std::size_t bytes = 0;
     for (const auto& [index, entry] : states) {
-        if (entry.references > state_store->checkpoint_references(entry.state)) { return 0; }
+        if (entry.references > state_store->checkpoint_references(entry.state)) { return false; }
         if (entry.references == state_store->checkpoint_references(entry.state) &&
             state_store->can_release_after_checkpoint_references(entry.state, entry.references) &&
             state_store->host_resident(entry.state)) {
-            bytes += state_images->host_layout().image_bytes;
+            on_state(entry.state);
         }
     }
-    const auto count = [&](const LogicalKVPageStore& pages, const auto& references) {
+    const auto visit = [&](const LogicalKVPageStore& pages, const auto& references) {
         for (const auto& [index, entry] : references) {
             if (entry.references != pages.address_references(entry.page)) { continue; }
             // A nonlast reference may retire during a copy; the complete set cannot release
@@ -342,17 +348,43 @@ std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> h
             if (pages.source_pins(entry.page) || pages.active_address_references(entry.page)) {
                 return false;
             }
-            if (pages.host_resident(entry.page)) {
-                bytes += (&pages == text_kv_pages.get() ? text_host_kv_page_stride
-                                                        : backend_host_kv_page_stride);
-            }
+            if (pages.host_resident(entry.page)) { on_page(pages, entry.page); }
         }
         return true;
     };
-    if (!count(*text_kv_pages, main) || (backend_kv_pages && !count(*backend_kv_pages, backend))) {
-        return 0;
-    }
-    return bytes;
+    return visit(*text_kv_pages, main) && (!backend_kv_pages || visit(*backend_kv_pages, backend));
+}
+
+std::size_t ProgramImpl::host_bytes_released(std::span<const CheckpointHandle> handles) const {
+    std::size_t bytes     = 0;
+    const bool releasable = visit_host_released(
+        handles, [&](StateImageHandle) { bytes += state_images->host_layout().image_bytes; },
+        [&](const LogicalKVPageStore& pages, LogicalKVPageHandle) {
+            bytes += host_kv_page_stride(pages);
+        });
+    return releasable ? bytes : 0;
+}
+
+bool ProgramImpl::host_can_place(std::span<const HostAllocationRun> runs,
+                                 std::span<const CheckpointHandle> released) const {
+    if (!host_context_arena) { return total_bytes(runs) == 0; }
+    // The ranges a release returns are what the placement sees as free: one StateImage slot per
+    // released image, one page stride per released page, coalesced by the arena itself.
+    std::vector<HostRange> ranges;
+    const bool releasable = visit_host_released(
+        released,
+        [&](StateImageHandle state) {
+            ranges.push_back(host_context_arena->range_of(state_store->host_view(state).data,
+                                                          state_images->host_layout().image_bytes));
+        },
+        [&](const LogicalKVPageStore& pages, LogicalKVPageHandle page) {
+            const auto& replica = pages.host_replica(page);
+            const auto extent   = host_kv_extents->view(replica.extent);
+            ranges.push_back(host_context_arena->range_of(
+                extent.subview(replica.page_offset, 1).data(), host_kv_page_stride(pages)));
+        });
+    if (!releasable) { ranges.clear(); }
+    return host_context_arena->can_place(runs, ranges);
 }
 
 std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) const {

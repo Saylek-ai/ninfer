@@ -20,6 +20,7 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 
+#include <functional>
 #include <algorithm>
 #include <cstdint>
 #include <array>
@@ -285,6 +286,8 @@ public:
     // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
     [[nodiscard]] std::size_t
     host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
+    [[nodiscard]] bool host_can_place(std::span<const HostAllocationRun> runs,
+                                      std::span<const CheckpointHandle> released) const;
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
     [[nodiscard]] std::size_t
     release_redundant_host(std::span<const CheckpointHandle> excluded,
@@ -513,6 +516,12 @@ public:
                            DeviceKVPageHandle destination, runtime::ContextResourceClass);
     void publish_context_transfers(ContextTransaction&);
     [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
+    [[nodiscard]] std::size_t host_kv_page_stride(const LogicalKVPageStore&) const noexcept;
+    // Visits the Host replicas that deleting this fixed set frees, physical sharing counted once.
+    // False when the set is not releasable, in which case deleting it frees nothing.
+    [[nodiscard]] bool visit_host_released(
+        std::span<const CheckpointHandle>, const std::function<void(StateImageHandle)>& on_state,
+        const std::function<void(const LogicalKVPageStore&, LogicalKVPageHandle)>& on_page) const;
     void install_binding(ContextTransaction&);
     void prepare_binding(ContextTransaction&);
     void complete_binding(ContextTransaction&, ContextProgress&);

@@ -1,5 +1,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 
+#include "core/host_placement.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -15,10 +17,14 @@ namespace {
 using Usage = ninfer::runtime::ContextResourceUsage;
 using Key   = std::vector<std::uint32_t>;
 using Role  = ninfer::runtime::CheckpointRole;
+using Run   = ninfer::HostAllocationRun;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
+
+// One Host allocation of `bytes`: the shape most writes in these tests ask the arena for.
+std::array<Run, 1> run(std::size_t bytes) { return {{{bytes, 1}}}; }
 
 struct Handle {
     std::uint32_t index;
@@ -115,6 +121,9 @@ struct Program {
     std::uint32_t main_capacity    = 1024;
     bool transfer_in_progress      = false;
     bool combined_demotion_blocked = false;
+    // Free Host bytes split into holes none of these tests' allocations fit in; the remaining
+    // free bytes form one usable extent, which deleted blocks return to.
+    std::vector<std::size_t> host_fragments;
 
     std::size_t host_block(std::size_t bytes, bool external_reference = false) {
         blocks.push_back({bytes, external_reference});
@@ -211,6 +220,42 @@ struct Program {
         return bytes;
     }
 
+    [[nodiscard]] std::vector<std::size_t> host_holes(std::span<const Handle> victims) const {
+        std::size_t fragmented = 0;
+        for (const auto hole : host_fragments) { fragmented += hole; }
+        const auto occupied = physical_usage().occupied.host_bytes;
+        require(occupied + fragmented <= host_capacity, "fixture fragments exceed free Host bytes");
+        std::vector<std::size_t> holes{host_capacity - occupied - fragmented +
+                                       host_bytes_released(victims)};
+        holes.insert(holes.end(), host_fragments.begin(), host_fragments.end());
+        return holes;
+    }
+
+    // First-fit over the holes, as the arena places: a run fits only when its allocations do.
+    [[nodiscard]] bool host_can_place(std::span<const Run> runs,
+                                      std::span<const Handle> victims = {}) const {
+        auto holes = host_holes(victims);
+        for (const auto& run : runs) {
+            if (!run.count) { continue; }
+            if (!run.bytes) { return false; }
+            std::uint64_t remaining = run.count;
+            for (auto& hole : holes) {
+                if (!remaining) { break; }
+                const auto fits = std::min<std::uint64_t>(remaining, hole / run.bytes);
+                hole -= fits * run.bytes;
+                remaining -= fits;
+            }
+            if (remaining) { return false; }
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t placeable(std::size_t bytes) const {
+        std::uint64_t count = 0;
+        for (const auto hole : host_holes({})) { count += hole / bytes; }
+        return count;
+    }
+
     [[nodiscard]] bool valid_checkpoint(Handle handle) const {
         return handle.index < contents.size() && contents[handle.index].alive;
     }
@@ -262,7 +307,7 @@ struct Program {
 
     struct Demotion {
         Handle handle;
-        std::size_t host_bytes;
+        Run host_run;
         std::vector<Handle> sources;
         Usage released;
         std::vector<std::pair<Handle, std::uint32_t>> main_parts;
@@ -333,7 +378,7 @@ struct Program {
             if (!units) { continue; }
             result.push_back(
                 {handle,
-                 *content.demotion_bytes * units,
+                 Run{*content.demotion_bytes, static_cast<std::uint32_t>(units)},
                  {handle},
                  released,
                  released.main_kv_pages
@@ -349,25 +394,26 @@ struct Program {
         if (ordered.empty() || shortage.state_slots || !shortage.main_kv_pages) {
             return std::nullopt;
         }
-        Demotion combined{ordered.front().handle, 0, {}, {}};
-        auto remaining   = shortage.main_kv_pages;
-        const auto usage = physical_usage();
-        auto host_left   = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        Demotion combined{ordered.front().handle, {}, {}, {}};
+        auto remaining = shortage.main_kv_pages;
         // The fixture supplies disjoint, explicit page quantities. Physical aliases,
-        // reservations and transfer leases belong to the Native contract tests.
+        // reservations and transfer leases belong to the Native contract tests. One batch
+        // moves one pool, so every part allocates the same page size.
         for (const auto& plan : ordered) {
             if (plan.main_parts.empty()) { break; }
             for (const auto& [handle, pages] : plan.main_parts) {
                 const auto bytes = *contents.at(handle.index).demotion_bytes;
-                const auto take  = static_cast<std::uint32_t>(std::min<std::size_t>(
-                    std::min(remaining, pages), bytes ? host_left / bytes : remaining));
+                require(!combined.host_run.count || combined.host_run.bytes == bytes,
+                        "fixture batch mixed page sizes");
+                const auto room = bytes ? placeable(bytes) - combined.host_run.count : remaining;
+                const auto take = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(std::min(remaining, pages), room));
                 if (take) {
                     combined.main_parts.emplace_back(handle, take);
                     combined.sources.push_back(handle);
                     combined.released.main_kv_pages += take;
-                    combined.host_bytes += take * bytes;
+                    combined.host_run = {bytes, combined.host_run.count + take};
                     remaining -= take;
-                    host_left -= take * bytes;
                 }
                 if (take < pages || !remaining) {
                     return combined.main_parts.empty() ? std::nullopt
@@ -497,10 +543,7 @@ struct Program {
                         [&](auto handle) { return contents.at(handle.index).demotion_blocked; })) {
             return false;
         }
-        const auto usage = physical_usage();
-        if (plan.host_bytes > usage.capacity.host_bytes - usage.occupied.host_bytes) {
-            return false;
-        }
+        if (!host_can_place(std::span(&plan.host_run, 1), {})) { return false; }
         if (!plan.main_parts.empty()) {
             for (const auto& [handle, pages] : plan.main_parts) {
                 auto& content    = contents.at(handle.index);
@@ -511,7 +554,10 @@ struct Program {
             }
         } else {
             auto& content = contents.at(plan.handle.index);
-            if (plan.host_bytes) { content.host_blocks.push_back(host_block(plan.host_bytes)); }
+            if (plan.host_run.count) {
+                content.host_blocks.push_back(
+                    host_block(plan.host_run.bytes * plan.host_run.count));
+            }
             if (plan.released.state_slots) { content.device_state = false; }
             demoted.push_back(plan.handle);
         }
@@ -1876,6 +1922,81 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
 
 } // namespace
 
+void test_fragmented_host_evicts_a_victim_and_completes_the_demotion() {
+    // Free Host bytes exceed the move's need, but no single hole holds one page: the planner
+    // must take a victim first, then the move reserves in the space that victim returns.
+    Fixture f(32);
+    const auto victim                             = f.program.add({1}, {f.program.host_block(16)});
+    f.program.contents[victim.index].device_state = false;
+    f.program.contents[victim.index].main_pages   = 0;
+    const auto incoming                           = f.program.add({2, 3});
+    f.program.contents[incoming.index].demotion_bytes = 8;
+    f.publish(victim);
+    f.publish(incoming);
+    f.program.host_fragments = {6, 6, 4};
+    require(!f.program.host_can_place(run(8)) &&
+                f.program.physical_usage().occupied.host_bytes == 16,
+            "fixture free bytes should exceed the need while no hole fits it");
+    require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
+                ninfer::runtime::ReclaimProgress::Changed,
+            "fragmented Host blocked a move that one victim could make room for");
+    require(f.program.released == std::vector<Handle>{victim} &&
+                f.program.demoted == std::vector<Handle>{incoming} &&
+                f.program.valid_checkpoint(incoming) &&
+                f.program.physical_usage().occupied.host_bytes == 8,
+            "planner did not evict the cold victim and move the source in one decision");
+}
+
+void test_unplaceable_host_frees_nothing_and_keeps_the_hot_history() {
+    // Nothing admissible can make the move placeable: the Host tier stays as it is, and the
+    // Device shortage is met by the planner's next action, the release of the cold source.
+    Fixture f(32);
+    const auto hot                             = f.program.add({1}, {f.program.host_block(16)});
+    f.program.contents[hot.index].device_state = false;
+    f.program.contents[hot.index].main_pages   = 0;
+    const auto incoming                        = f.program.add({2, 3});
+    f.program.contents[incoming.index].demotion_bytes = 8;
+    f.publish(hot);
+    f.publish(incoming);
+    f.use_shared(hot);
+    f.program.host_fragments = {6, 6, 4};
+    require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
+                ninfer::runtime::ReclaimProgress::Changed,
+            "device shortage was not met when the Host tier could not take the source");
+    require(f.program.released == std::vector<Handle>{incoming} && f.program.demoted.empty() &&
+                f.program.valid_checkpoint(hot) &&
+                f.program.physical_usage().occupied.host_bytes == 16,
+            "an unplaceable move deleted hot Host history or left the shortage unmet");
+}
+
+void test_host_victims_prefer_the_smaller_sufficient_release() {
+    // Free bytes fall two short of the move's page. One victim frees exactly those two, the
+    // other four times as much; either alone makes the page placeable. Ranking benefit is
+    // capped by the deficit, so the smaller release with the smaller loss is the one taken.
+    // The move preserves ten tokens, so both victims are admissible and only ranking decides.
+    Fixture f(16);
+    const auto small = f.program.add({1}, {f.program.host_block(2)});
+    const auto large = f.program.add({2, 3, 4}, {f.program.host_block(8)});
+    for (const auto handle : {small, large}) {
+        f.program.contents[handle.index].device_state = false;
+        f.program.contents[handle.index].main_pages   = 0;
+    }
+    const auto incoming                               = f.program.add(tokens(10, 100));
+    f.program.contents[incoming.index].demotion_bytes = 8;
+    f.publish(small);
+    f.publish(large);
+    f.publish(incoming);
+    require(!f.program.host_can_place(run(8)) && f.program.host_can_place(run(8), {&small, 1}) &&
+                f.program.host_can_place(run(8), {&large, 1}),
+            "either victim alone should make the page placeable");
+    require(f.cache.reclaim(f.program, {.main_kv_pages = 1}) ==
+                ninfer::runtime::ReclaimProgress::Changed,
+            "the move found no Host room");
+    require(f.program.released == std::vector<Handle>{small} &&
+                f.program.demoted == std::vector<Handle>{incoming},
+            "placement ranking sacrificed more history than the sufficient small release");
+}
+
 int main() {
     try {
         test_demotion_competes_with_its_actual_host_recovery_loss();
@@ -1890,6 +2011,9 @@ int main() {
         test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it();
         test_proven_deep_progress_survives_a_shallow_fallback_and_fork();
         test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix();
+        test_fragmented_host_evicts_a_victim_and_completes_the_demotion();
+        test_unplaceable_host_frees_nothing_and_keeps_the_hot_history();
+        test_host_victims_prefer_the_smaller_sufficient_release();
         test_inherited_owner_heat_cannot_spend_a_full_other_continuation();
         test_exact_repeated_candidate_can_replace_a_long_hotspot_with_common_fallback();
         test_old_candidate_demand_cannot_borrow_a_new_owner_epoch();

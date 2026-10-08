@@ -124,27 +124,92 @@ void HostContextArena::release(std::size_t offset, std::size_t bytes, bool reser
     occupied_bytes_ -= bytes;
     if (reserved) { reserved_bytes_ -= bytes; }
     --allocation_count_;
-    insert_free_extent({offset, bytes});
+    insert_free_extent(free_extents_, {offset, bytes});
 }
 
-void HostContextArena::insert_free_extent(FreeExtent extent) noexcept {
+void HostContextArena::insert_free_extent(std::vector<FreeExtent>& extents, FreeExtent extent) {
     const auto position = std::lower_bound(
-        free_extents_.begin(), free_extents_.end(), extent.offset,
+        extents.begin(), extents.end(), extent.offset,
         [](const FreeExtent& candidate, std::size_t offset) { return candidate.offset < offset; });
-    auto inserted = free_extents_.insert(position, extent);
-    if (inserted != free_extents_.begin()) {
+    auto inserted = extents.insert(position, extent);
+    if (inserted != extents.begin()) {
         auto previous = inserted - 1;
         if (previous->offset + previous->bytes == inserted->offset) {
             previous->bytes += inserted->bytes;
-            free_extents_.erase(inserted);
+            extents.erase(inserted);
             inserted = previous;
         }
     }
     const auto next = inserted + 1;
-    if (next != free_extents_.end() && inserted->offset + inserted->bytes == next->offset) {
+    if (next != extents.end() && inserted->offset + inserted->bytes == next->offset) {
         inserted->bytes += next->bytes;
-        free_extents_.erase(next);
+        extents.erase(next);
     }
+}
+
+bool HostContextArena::can_place(std::span<const HostAllocationRun> runs,
+                                 std::span<const HostRange> freed) const {
+    std::vector<FreeExtent> returned;
+    returned.reserve(freed.size());
+    for (const auto& range : freed) {
+        if (range.bytes) { returned.push_back({range.offset, range.bytes}); }
+    }
+    std::sort(returned.begin(), returned.end(),
+              [](const FreeExtent& a, const FreeExtent& b) { return a.offset < b.offset; });
+    // One ordered merge of the current free extents with the returning ranges, coalescing
+    // neighbours as release() does, gives the extents those releases would leave behind.
+    std::vector<FreeExtent> extents;
+    extents.reserve(free_extents_.size() + returned.size());
+    const auto append = [&](FreeExtent extent) {
+        if (!extents.empty() && extents.back().offset + extents.back().bytes == extent.offset) {
+            extents.back().bytes += extent.bytes;
+        } else {
+            extents.push_back(extent);
+        }
+    };
+    auto current = free_extents_.begin();
+    auto coming  = returned.begin();
+    while (current != free_extents_.end() || coming != returned.end()) {
+        if (coming == returned.end() ||
+            (current != free_extents_.end() && current->offset < coming->offset)) {
+            append(*current++);
+        } else {
+            append(*coming++);
+        }
+    }
+    for (const auto& run : runs) {
+        if (!run.count) { continue; }
+        const std::size_t rounded = allocation_bytes(run.bytes);
+        if (rounded == 0) { return false; }
+        std::uint64_t remaining = run.count;
+        // allocate() takes the first extent that fits and carves from its start, so equal-size
+        // allocations fill each extent in address order before moving to the next one.
+        for (auto& extent : extents) {
+            if (!remaining) { break; }
+            const std::uint64_t fits = std::min<std::uint64_t>(remaining, extent.bytes / rounded);
+            extent.offset += fits * rounded;
+            extent.bytes -= fits * rounded;
+            remaining -= fits;
+        }
+        if (remaining) { return false; }
+    }
+    return true;
+}
+
+std::uint64_t HostContextArena::placeable_count(std::size_t bytes) const noexcept {
+    const std::size_t rounded = allocation_bytes(bytes);
+    if (rounded == 0) { return 0; }
+    std::uint64_t count = 0;
+    for (const auto& extent : free_extents_) { count += extent.bytes / rounded; }
+    return count;
+}
+
+HostRange HostContextArena::range_of(const std::byte* data, std::size_t bytes) const {
+    const auto* base = static_cast<const std::byte*>(backing_->data());
+    if (data < base || static_cast<std::size_t>(data - base) + bytes > capacity_bytes_) {
+        throw std::out_of_range("Host range is outside the context arena");
+    }
+    return {static_cast<std::size_t>(data - base), bytes};
 }
 
 } // namespace ninfer

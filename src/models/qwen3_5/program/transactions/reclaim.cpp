@@ -705,7 +705,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             plan->state     = StateDemotion{state, program.state_store->content_epoch(state), host,
                                         owners.sources};
             candidate.released.state_slots = 1;
-            candidate.host_bytes = host ? 0 : program.state_images->host_layout().image_bytes;
+            candidate.host_run = {program.state_images->host_layout().image_bytes, host ? 0U : 1U};
             break;
         }
         if (!plan->state) { return std::nullopt; }
@@ -721,6 +721,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
         const auto stride = resource == runtime::ContextResourceClass::MainKV
                                 ? program.text_host_kv_page_stride
                                 : program.backend_host_kv_page_stride;
+        candidate.host_run.bytes = stride;
         for (const auto& object : objects) {
             const auto page = object.handle;
             if (pages.active_address_references(page) || pages.source_pins(page) ||
@@ -731,7 +732,7 @@ std::optional<ContextDemotion> quote_demotion(const ProgramImpl& program,
             const auto host = pages.host_resident(page);
             plan->pages.push_back({page, object.position, pages.content_epoch(page),
                                    pages.committed_columns(page), host, owners.sources});
-            if (!host) { candidate.host_bytes += stride; }
+            if (!host) { ++candidate.host_run.count; }
             if (plan->pages.size() == needed) { break; }
         }
         if (plan->pages.empty()) { return std::nullopt; }
@@ -956,18 +957,23 @@ struct DemotionBatch {
         const auto stride    = resource == runtime::ContextResourceClass::MainKV
                                    ? program.text_host_kv_page_stride
                                    : program.backend_host_kv_page_stride;
-        const auto usage     = program.physical_usage();
-        const auto available = usage.capacity.host_bytes - usage.occupied.host_bytes;
+        // Each page without a Host copy needs one contiguous page allocation; the arena, not
+        // the free byte total, says how many of those its current extents hold.
+        const auto placeable =
+            program.host_context_arena ? program.host_context_arena->placeable_count(stride) : 0;
         auto plan            = std::make_shared<DemotionPlan>();
         plan->owner          = &program;
         plan->resource       = resource;
         plan->excluded       = components.front()->excluded;
         ContextDemotion result;
+        result.host_run.bytes = stride;
         for (const auto* page : ordered) {
-            const auto bytes = page->host_resident ? 0 : stride;
-            if (plan->pages.size() == needed || bytes > available - result.host_bytes) { break; }
+            const bool allocates = !page->host_resident;
+            if (plan->pages.size() == needed || (allocates && result.host_run.count >= placeable)) {
+                break;
+            }
             plan->pages.push_back(*page);
-            result.host_bytes += bytes;
+            if (allocates) { ++result.host_run.count; }
             plan->allowed.insert(plan->allowed.end(), page->references.begin(),
                                  page->references.end());
         }
@@ -1022,8 +1028,8 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             state_store->host_resident(expected.handle) != expected.host_resident ||
             !state_store->can_release_after_checkpoint_references(
                 expected.handle, state_store->checkpoint_references(expected.handle)) ||
-            quote.host_bytes !=
-                (expected.host_resident ? 0 : state_images->host_layout().image_bytes)) {
+            quote.host_run != HostAllocationRun{state_images->host_layout().image_bytes,
+                                                expected.host_resident ? 0U : 1U}) {
             return false;
         }
     } else {
@@ -1053,8 +1059,8 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
                  main ? record.kv->text : *record.kv->backend,
                  kv_pages_for_frontier(main ? record.frontier : record.backend_frontier)});
         }
-        const auto stride      = main ? text_host_kv_page_stride : backend_host_kv_page_stride;
-        std::size_t host_bytes = 0;
+        const auto stride = main ? text_host_kv_page_stride : backend_host_kv_page_stride;
+        HostAllocationRun host_run{stride, 0};
         std::vector<std::uint32_t> descriptors;
         descriptors.reserve(plan.pages.size());
         for (const auto& page : plan.pages) {
@@ -1080,11 +1086,11 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
             }
             if (matched != page.references.size()) { return false; }
             descriptors.push_back(pages->descriptor_index(page.handle));
-            if (!page.host_resident) { host_bytes += stride; }
+            if (!page.host_resident) { ++host_run.count; }
         }
         std::sort(descriptors.begin(), descriptors.end());
         if (std::adjacent_find(descriptors.begin(), descriptors.end()) != descriptors.end() ||
-            host_bytes != quote.host_bytes) {
+            host_run != quote.host_run) {
             return false;
         }
     }

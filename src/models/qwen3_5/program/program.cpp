@@ -191,6 +191,11 @@ std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) co
     return impl_->pause_host_bytes(sequence);
 }
 
+bool Program::host_can_place(std::span<const HostAllocationRun> runs,
+                             std::span<const CheckpointHandle> released) const {
+    return impl_->host_can_place(runs, released);
+}
+
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
                                             std::optional<SequenceHandle> pending_backup) {
     return impl_->release_redundant_host(excluded, pending_backup);

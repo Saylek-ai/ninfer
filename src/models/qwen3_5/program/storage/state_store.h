@@ -205,6 +205,14 @@ public:
         return require(handle).host_slot.has_value();
     }
 
+    [[nodiscard]] qwen3_5::HostStateImageConstView host_view(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (host_ == nullptr || !object.host_slot) {
+            throw std::logic_error("StateImage has no Host replica to view");
+        }
+        return host_->view(*object.host_slot);
+    }
+
     [[nodiscard]] std::uint64_t content_epoch(StateImageHandle handle) const {
         return require(handle).content_epoch;
     }

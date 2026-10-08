@@ -1,9 +1,11 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_placement.h"
 
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -82,6 +84,15 @@ public:
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
+    // Whether every run fits first-fit, in order, into the free extents left once the `freed`
+    // ranges have returned. Placement, not the free byte total, decides whether a write can
+    // reserve; this is the same walk allocate() takes, without taking anything.
+    [[nodiscard]] bool can_place(std::span<const HostAllocationRun> runs,
+                                 std::span<const HostRange> freed = {}) const;
+    // How many allocations of `bytes` the current free extents hold, filling each in order.
+    [[nodiscard]] std::uint64_t placeable_count(std::size_t bytes) const noexcept;
+    // The arena range of `bytes` starting at `data`, a pointer into this arena's backing.
+    [[nodiscard]] HostRange range_of(const std::byte* data, std::size_t bytes) const;
     [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
     [[nodiscard]] std::pair<HostContextAllocation, HostContextAllocation>
     split(HostContextAllocation&& allocation, std::size_t byte_offset);
@@ -96,7 +107,7 @@ private:
 
     [[nodiscard]] std::size_t allocation_bytes(std::size_t bytes) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
-    void insert_free_extent(FreeExtent extent) noexcept;
+    static void insert_free_extent(std::vector<FreeExtent>& extents, FreeExtent extent);
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
 
     std::optional<PinnedHostBuffer> backing_;
