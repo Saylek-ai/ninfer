@@ -2,6 +2,19 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+> [!NOTE]
+> **Saylek fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)**, maintained by [Saylek](https://saylek.com).
+> The `saylek` branch is upstream `master` plus the fixes below; `master` mirrors upstream unchanged.
+> Each fix is offered upstream and dropped here once upstream has it.
+>
+> | Fix | Upstream issue | Branch |
+> |---|---|---|
+> | Host context tier: decide room by arena placement, not free bytes | [#378](https://github.com/Neroued/ninfer/issues/378) | `fix/378-host-placement` |
+> | Accept byte-identical duplicate tool parameters | [#244](https://github.com/Neroued/ninfer/issues/244) | `fix/244-duplicate-params` |
+>
+> Based on upstream `81c8ce09`. Releases are tagged `saylek-<upstream sha>-<n>`.
+> Report NInfer issues that are not about these fixes upstream.
+
 NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
