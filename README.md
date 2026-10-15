@@ -11,6 +11,7 @@
 > |---|---|---|
 > | Host context tier: decide room by arena placement, not free bytes | [#378](https://github.com/Neroued/ninfer/issues/378) | `fix/378-host-placement` |
 > | Accept byte-identical duplicate tool parameters | [#244](https://github.com/Neroued/ninfer/issues/244) | `fix/244-duplicate-params` |
+> | Report whether the template supports tool calls | [#400](https://github.com/Neroued/ninfer/issues/400) | `fix/400-tool-support` |
 >
 > Based on upstream `81c8ce09`. Releases are tagged `saylek-<upstream sha>-<n>`.
 > Report NInfer issues that are not about these fixes upstream.
