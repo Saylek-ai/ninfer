@@ -179,27 +179,33 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
     request.allow_engine_automatic_shared_prefixes = false;
 }
 
+namespace {
+
+// vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit. Tool
+// support is llama.cpp's `chat_template_caps.supports_tools`, the shape its clients already read.
+Json model_json(const std::string& model_id, std::int64_t created, std::uint32_t max_model_len,
+                bool supports_tools) {
+    return {{"id", model_id},
+            {"object", "model"},
+            {"created", created},
+            {"owned_by", "ninfer"},
+            {"max_model_len", max_model_len},
+            {"chat_template_caps", Json{{"supports_tools", supports_tools}}}};
+}
+
+} // namespace
+
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len}}})}};
+                             std::uint32_t max_model_len, bool supports_tools) {
+    const Json payload = {
+        {"object", "list"},
+        {"data", Json::array({model_json(model_id, created, max_model_len, supports_tools)})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {{"id", model_id},
-                          {"object", "model"},
-                          {"created", created},
-                          {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len}};
-    return payload.dump();
+                              std::uint32_t max_model_len, bool supports_tools) {
+    return model_json(model_id, created, max_model_len, supports_tools).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

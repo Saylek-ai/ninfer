@@ -955,13 +955,16 @@ int test_stream_observations() {
 
 int test_common_objects() {
     int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000, true));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000, false));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+    failures += check(models["data"][0]["chat_template_caps"] == Json{{"supports_tools", true}} &&
+                          model["chat_template_caps"] == Json{{"supports_tools", false}},
+                      "a model object did not report whether its template supports tools");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

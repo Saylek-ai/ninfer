@@ -84,6 +84,8 @@ public:
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
+    // Whether the model's chat template declares tools and renders a call this Engine reads back.
+    [[nodiscard]] bool supports_tools() const;
 
     // Establishes queue membership synchronously with a fixed output consumer mode. Destroying an
     // unconsumed handle cancels its request; wait() owns result consumption and may run

@@ -2592,6 +2592,47 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
+// A model supports tools when its template declares a tool to it and renders a call that the Qwen
+// decoder reads back. The turn ends at its <|im_end|> stop, as the release's
+// generation_config.json says.
+int test_tool_support() {
+    const auto qwen = [](const std::string& chat_template) {
+        FrontendResources source      = resources(chat_template);
+        source.generation_config_json = R"({"eos_token_id":[6,248046]})";
+        return make_frontend(source).supports_tools();
+    };
+    int failures = check(qwen(thinking_toggle_template_source()),
+                         "the Qwen3.6 template did not round-trip a tool call");
+    failures += check(qwen(reasoning_effort_template_source()),
+                      "the Qwen3.8 template did not round-trip a tool call");
+    const std::string turns =
+        "{%- for message in messages -%}<|im_start|>{{ message.role }}\n"
+        "{% if message.content is string %}{{ message.content }}{% endif %}";
+    const std::string close =
+        "<|im_end|>\n{% endfor -%}{%- if add_generation_prompt %}<|im_start|>assistant\n"
+        "{% endif -%}";
+    const std::string declared =
+        "{%- if tools %}<|im_start|>system\n{% for tool in tools %}{{ tool | tojson }}\n"
+        "{% endfor %}<|im_end|>\n{% endif -%}";
+    failures += check(!qwen(turns + close), "a template that renders no tools supports them");
+    failures += check(
+        !qwen(declared + turns +
+              "{%- for call in message.tool_calls | default([]) %}[TOOL_CALLS]"
+              "{{ call.function.name }}{{ call.function.arguments | tojson }}{% endfor %}" +
+              close),
+        "a call syntax the Qwen decoder does not read supports tools");
+    failures += check(
+        !qwen(turns +
+              "{%- for call in message.tool_calls | default([]) %}<tool_call>\n<function="
+              "{{ call.function.name }}>\n"
+              "{% for name, value in call.function.arguments | dictsort %}"
+              "<parameter={{ name }}>\n{{ value }}\n</parameter>\n{% endfor %}</function>\n"
+              "</tool_call>{% endfor %}" +
+              close),
+        "a template that renders calls but never declares the tools supports them");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = make_frontend(owned);
@@ -2644,5 +2685,6 @@ int main() {
     failures += test_media_preparation_cancellation();
     failures += test_invalid_media_classification();
     failures += test_disabled_vision();
+    failures += test_tool_support();
     return failures == 0 ? 0 : 1;
 }

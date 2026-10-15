@@ -8,6 +8,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/qwen3_5/frontend/tool_contract.h"
 #include "models/qwen3_5/frontend/tool_grammar.h"
 #include "text/unicode.h"
@@ -522,6 +523,58 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
     return out;
 }
 
+// Whether the model can run tools through this server, settled once at load. The chat template is
+// the model's own record of its tool training, so the check runs a declared probe tool through it
+// both ways: the declaration must reach the prompt, and an assistant turn calling the tool, cut
+// where generation stops, must read back through the Qwen output decoder as that one call. A
+// template that drops either half, or writes calls in a syntax the decoder does not read, makes a
+// model whose tool calls would come back as text.
+bool round_trips_tool_call(const fi::CompiledChatTemplate& chat_template,
+                           const fi::Tokenizer& tokenizer, const StopPolicy& stops) {
+    constexpr std::string_view kName = "ninfer_tool_probe";
+    const Json arguments             = {{"value", "probe"}};
+    const Json parameters            = {{"type", "object"},
+                                        {"properties", {{"value", {{"type", "string"}}}}},
+                                        {"required", Json::array({"value"})}};
+    const Json declaration           = {{"type", "function"},
+                                        {"function",
+                                         {{"name", kName},
+                                          {"description", "Probe."},
+                                          {"parameters", parameters},
+                                          {"strict", false}}}};
+    fi::ChatRenderOptions options;
+    options.tool_jsons = {declaration.dump()};
+    fi::ChatMessage user{.role = ChatRole::User, .parts = {fi::ChatPart::text_part("probe")}};
+    fi::ChatMessage call{.role = ChatRole::Assistant};
+    call.tool_calls.push_back(
+        {.id = "call_0", .name = std::string(kName), .arguments_json = arguments.dump()});
+
+    // A template that cannot render tools at all refuses them; that is the answer, not a fault.
+    std::string turn;
+    try {
+        if (chat_template.render({user}, options).text.find(kName) == std::string::npos) {
+            return false;
+        }
+        options.add_generation_prompt = false;
+        const fi::RenderedChat rendered = chat_template.render({user, call}, options);
+        const auto& boundaries          = rendered.message_boundaries;
+        if (boundaries.size() != 3 || !boundaries[1] || !boundaries[2]) { return false; }
+        turn = rendered.text.substr(*boundaries[1], *boundaries[2] - *boundaries[1]);
+    } catch (const std::exception&) { return false; }
+    for (const TokenId stop : stops.token_ids) {
+        const std::string_view text = tokenizer.decode_token_bytes(stop, false);
+        const std::size_t at        = text.empty() ? std::string::npos : turn.find(text);
+        if (at != std::string::npos) { turn.resize(at); }
+    }
+
+    fi::ToolCallOutputDecoder decoder(fi::build_tool_call_output_contract(options.tool_jsons),
+                                      OutputOptions{}.tool_name_max_length);
+    (void)decoder.feed(turn);
+    const std::vector<GeneratedToolCall> calls = decoder.finish().tool_calls;
+    return calls.size() == 1 && calls[0].name == kName &&
+           Json::parse(calls[0].arguments_json, nullptr, false) == arguments;
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
@@ -600,6 +653,7 @@ public:
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+        supports_tools          = round_trips_tool_call(chat_template, *tokenizer, defaults);
     }
 
     fi::CompiledChatTemplate chat_template;
@@ -609,6 +663,7 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    bool supports_tools             = false;
     bool vision_enabled             = true;
     std::uint32_t max_context       = 0;
     std::size_t grammar_cache_bytes = 0;
@@ -688,6 +743,8 @@ Frontend::~Frontend()                              = default;
 const ModelSamplingDefaults& Frontend::sampling_defaults() const noexcept {
     return impl_->sampling;
 }
+
+bool Frontend::supports_tools() const noexcept { return impl_->supports_tools; }
 
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, options));
