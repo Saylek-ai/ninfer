@@ -280,6 +280,11 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
     return impl_->sampling_defaults;
 }
 
+bool Engine::supports_tools() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.supports_tools();
+}
+
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
                                 GenerationObservationOptions observation,

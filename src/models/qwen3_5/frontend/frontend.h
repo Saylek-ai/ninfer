@@ -81,6 +81,8 @@ public:
                         const ToolChoice& tool_choice                     = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
     [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
+    // Whether a declared tool reaches the prompt and a rendered call to it reads back as that call.
+    [[nodiscard]] bool supports_tools() const noexcept;
 
 private:
     class Impl;

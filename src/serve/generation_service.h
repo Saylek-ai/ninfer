@@ -138,6 +138,8 @@ public:
         return engine_->sampling_defaults();
     }
 
+    [[nodiscard]] bool supports_tools() const { return engine_->supports_tools(); }
+
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           ninfer::GenerationObservationOptions observation = {},

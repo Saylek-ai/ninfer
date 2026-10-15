@@ -57,8 +57,8 @@ selected for this process.
 |---|---|
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
-| `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
-| `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
+| `GET /v1/models` | configured OpenAI model alias, effective `max_model_len` and `chat_template_caps.supports_tools` |
+| `GET /v1/models/{id}` | lookup of the configured alias, effective `max_model_len` and `chat_template_caps.supports_tools` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -71,6 +71,12 @@ selected for this process.
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
+
+`chat_template_caps.supports_tools` on each model object is llama.cpp's tool-support field, settled
+once at load. It is true when a probe tool declared through the model's chat template reaches the
+prompt and an assistant turn calling it, cut at the model's stop token, decodes through the Qwen
+tool-call decoder as that one call. A template that drops either half, writes calls in another
+syntax, or cannot render tools reports false; that model's tool calls would come back as text.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
