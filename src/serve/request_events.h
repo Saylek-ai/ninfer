@@ -11,7 +11,8 @@
 namespace ninfer::serve {
 
 struct RequestLogContext {
-    std::uint64_t id = 0;
+    std::uint64_t engine_request_id = 0;
+    std::uint64_t id                = 0;
     std::string http_request_id;
     std::string response_id;
     std::string protocol;
@@ -95,6 +96,7 @@ struct RequestFailure {
 };
 
 struct ThroughputReport {
+    ExecutionStatistics previous_execution{}, current_execution{};
     double interval_seconds               = 0.0;
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;

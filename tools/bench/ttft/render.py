@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from tools.bench.ttft.diagnostics import TTFT_STAGES, request_timing_analysis
+from tools.bench.ttft.diagnostics import POOL_USAGE_FIELDS, TTFT_STAGES, request_timing_analysis
 from tools.bench.ttft.report import ReportError, load_campaign, summarize_campaign
 
 
@@ -557,7 +557,7 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         ((row["case"], row["sample"], row["status"], row.get("intervals", "—"),
           row.get("shutdown_tail", "—"), seconds(row.get("reported_interval_seconds")),
           seconds(row.get("host_work", {}).get("elapsed_seconds", {}).get("total")),
-          seconds(row.get("host_work", {}).get("device_wait_seconds")), row.get("reason", "—"))
+          seconds(row.get("host_work", {}).get("scheduler_yield_seconds")), row.get("reason", "—"))
          for row in rows),
     ))
     available = [row for row in rows if row["status"] == "available"]
@@ -566,23 +566,33 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
         lines.extend(_table(
             ("Case", "Sample", "Resource", "Direction", "Bytes", "Seconds"),
             ((row["case"], row["sample"], resource, direction, values["bytes"], seconds(values["seconds"]))
-             for row in available for resource, directions in row["transfers"].items()
+             for row in available for resource, directions in {
+                 "state": row["transfers"]["state"],
+                 **{f"kv_pool_{pool}": values for pool, values in row["transfers"]["kv_pools"].items()},
+             }.items()
              for direction, values in directions.items()),
         ))
         lines.extend([
             "", "### Resource occupancy", "",
-            "Sampled maxima can miss short-lived allocations. Only the Host allocator's recorded",
+            "Sampled maxima can miss short-lived allocations. Each rank/domain pool's recorded",
             "lifetime high-water mark is labelled peak. Startup backing/capacity and the full Host",
             "work breakdown remain in the JSON report; sampled occupancy is not reserved backing.", "",
         ])
         lines.extend(_table(
             ("Case", "Sample", "Resource", "Sampled max", "Last sample"),
             ((row["case"], row["sample"], resource, value["sampled_max"], value["last"])
-             for row in available for resource, value in row["occupancy"].items()),
+             for row in available for resource, value in {
+                 **{key: row["occupancy"][key] for key in ("state_objects", "history_objects")},
+                 **{f"metadata.{key}": value for key, value in row["occupancy"]["metadata"].items()},
+                 **{f"kv_pool_{pool}": value for pool, value in row["occupancy"]["kv_pools"].items()},
+                 **{f"rank_{pool['rank']}.{pool['domain']}.{field}": pool[field]
+                    for pool in row["occupancy"]["pools"] for field in POOL_USAGE_FIELDS},
+             }.items()),
         ))
         lines.extend(["", *_table(
-            ("Case", "Sample", "Host allocator peak occupied bytes"),
-            ((row["case"], row["sample"], row["host_context_peak_occupied_bytes"]) for row in available),
+            ("Case", "Sample", "Rank", "Domain", "Observed intervals", "Pool peak occupied bytes"),
+            ((row["case"], row["sample"], pool["rank"], pool["domain"], pool["observations"],
+              pool["peak_occupied_bytes"]) for row in available for pool in row["occupancy"]["pools"]),
         )])
     return [*lines, ""]
 
@@ -614,10 +624,10 @@ def _request_timing_markdown(summary: dict[str, Any]) -> list[str]:
         rows.append((case, f"{len(measured)}/{len(requests)}", inconsistent,
                      mean(measured, "ttft_ms"),
                      *(mean(measured, f"{stage}_ms") for stage in TTFT_STAGES),
-                     mean(measured, "host_total_ms"), mean(measured, "prefill_gpu_ms")))
+                     mean(measured, "host_total_ms"), mean(measured, "prefill_total_ms")))
     lines.extend(_table(
         ("Case", "Partitioned", "Inconsistent", "TTFT", "Prepare", "Queue", "Bind", "Paused",
-         "Resident", "HTTP residual", "Host exposure", "Prefill GPU interval"), rows,
+         "Resident", "HTTP residual", "Host exposure", "Completed prefill interval"), rows,
     ))
     return [*lines, ""]
 
@@ -844,8 +854,11 @@ def render_csv(summary: dict[str, Any]) -> str:
 
 
 def render_request_analysis_csv(summary: dict[str, Any]) -> str:
-    fields = ("case", "profile_label", "sample", "request_role", "outcome", "constructed",
-              "wire_request_id", "engine_request_id", *request_timing_analysis({}), "raw")
+    fields = ["case", "profile_label", "sample", "request_role", "outcome", "constructed",
+              "wire_request_id", "engine_request_id", *request_timing_analysis({})]
+    fields.extend(sorted({key for row in summary["request_timing_analysis"] for key in row
+                          if key not in fields and key != "raw"}))
+    fields.append("raw")
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(stream, fieldnames=fields)
     writer.writeheader()

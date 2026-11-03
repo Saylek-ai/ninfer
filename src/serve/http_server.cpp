@@ -40,11 +40,15 @@ void ensure_http_request_id(const httplib::Request& request, httplib::Response& 
     }
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const ninfer::EngineSnapshot& before,
+                                        const ninfer::EngineSnapshot& after,
                                         double interval_seconds) {
+    const auto& previous = before.runtime;
+    const auto& current  = after.runtime;
     return ThroughputReport{
-        .interval_seconds = interval_seconds,
+        .previous_execution = before.executions,
+        .current_execution  = after.executions,
+        .interval_seconds   = interval_seconds,
         .computed_prefill_tokens =
             current.computed_prefill_tokens - previous.computed_prefill_tokens,
         .committed_decode_tokens =
@@ -76,39 +80,25 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.materialization_state_forks !=
                report.previous.materialization_state_forks ||
            report.current.state_restores != report.previous.state_restores ||
-           report.current.state_d2h_count != report.previous.state_d2h_count ||
-           report.current.state_h2d_count != report.previous.state_h2d_count ||
-           report.current.state_d2d_count != report.previous.state_d2d_count ||
-           report.current.main_kv_d2h_pages != report.previous.main_kv_d2h_pages ||
-           report.current.main_kv_h2d_pages != report.previous.main_kv_h2d_pages ||
-           report.current.main_kv_d2d_pages != report.previous.main_kv_d2d_pages ||
-           report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
-           report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
-           report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
+           report.current.context_transfers != report.previous.context_transfers ||
            report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.device_state_occupied_slots !=
-               report.previous.device_state_occupied_slots ||
-           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
-           report.current.device_main_kv_occupied_pages !=
-               report.previous.device_main_kv_occupied_pages ||
-           report.current.device_backend_kv_occupied_pages !=
-               report.previous.device_backend_kv_occupied_pages ||
-           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.host_context_occupied_bytes !=
-               report.previous.host_context_occupied_bytes ||
-           report.current.host_context_reserved_bytes !=
-               report.previous.host_context_reserved_bytes ||
+           report.current.state_objects != report.previous.state_objects ||
+           report.current.history_objects != report.previous.history_objects ||
+           report.current.kv_pools != report.previous.kv_pools ||
+           report.current.context_pools != report.previous.context_pools ||
+           report.current.context_metadata != report.previous.context_metadata ||
            report.current.host_work.engine_boundary_ns !=
                report.previous.host_work.engine_boundary_ns ||
-           report.current.host_work.program_submit_ns !=
-               report.previous.host_work.program_submit_ns ||
-           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
+           report.current.host_work.session_call_ns != report.previous.host_work.session_call_ns ||
+           report.current.host_work.executor_poll_ns !=
+               report.previous.host_work.executor_poll_ns ||
            report.current.host_work.engine_commit_output_ns !=
                report.previous.host_work.engine_commit_output_ns ||
            report.current.host_work.engine_maintenance_ns !=
                report.previous.host_work.engine_maintenance_ns ||
-           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
+           report.current.host_work.scheduler_yield_ns !=
+               report.previous.host_work.scheduler_yield_ns;
 }
 
 const char* endpoint_name(std::string_view path) noexcept {
@@ -142,7 +132,7 @@ void write_anthropic_error(httplib::Response& response, const ApiError& api_erro
     response.set_content(make_anthropic_error_body(error, request_id), "application/json");
 }
 
-httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions& options,
+httplib::Server::HandlerResponse handle_unrendered_http_error(const product::ServeOptions& options,
                                                               const httplib::Request& request,
                                                               httplib::Response& response) {
     ensure_http_request_id(request, response);
@@ -200,16 +190,19 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
-HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
+HttpServer::HttpServer(product::ServeOptions options, std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(observations_.instance_id(), options_.launch.logging.request_jsonl.string(),
+                     options_.launch.engine.artifact_path.string(), std::move(logger)) {
+    request_jsonl_.write_startup_config(options_);
     const std::size_t queued_requests =
-        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
-    const std::size_t worker_count = queued_requests + 1;
+        static_cast<std::size_t>(options_.launch.engine.max_concurrency) +
+        options_.launch.engine.max_pending_requests;
+    const std::size_t worker_count = queued_requests + 1 + MonitorEvents::kMaxSubscribers;
     server_.new_task_queue         = [queued_requests, worker_count] {
-        return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
+        return make_http_task_queue(worker_count, queued_requests).release();
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
@@ -243,47 +236,49 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
 }
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
+    observations_.prepared(context);
     request_jsonl_.write_request_start(context);
     operational_log_.request_start(context);
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
-    metrics_.rejected();
+    observations_.rejected(context.id);
     request_jsonl_.write_request_rejected(context);
     operational_log_.request_rejected(context);
 }
 
-ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
-    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
-        metrics_.first_token(observation);
+ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer(std::uint64_t request_id) {
+    return [this, request_id](const ninfer::GenerationFirstTokenObservation& observation) {
+        observations_.first_token(request_id, observation);
     };
 }
 
 ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
                                                                      std::string http_request_id) {
-    if (!request_jsonl_.enabled()) { return {}; }
     return [this, request_id, http_request_id = std::move(http_request_id)](
                const ninfer::GenerationSchedulingObservation& observation) {
+        observations_.scheduling(request_id, observation);
         request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
     };
 }
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    metrics_.done(outcome);
+    observations_.done(context.id, outcome);
     request_jsonl_.write_request_done(context, outcome);
     operational_log_.request_done(context, outcome);
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
-    metrics_.failed(failure.classification == RequestFailureClass::ClientDisconnected);
+    observations_.failed(context.id,
+                         failure.classification == RequestFailureClass::ClientDisconnected);
     request_jsonl_.write_request_error(context, failure.machine_message);
     operational_log_.request_failure(context, failure);
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
-    metrics_.response_failed();
+    observations_.response_failed(request_id);
     operational_log_.response_failure(request_id, failure);
 }
 
@@ -294,9 +289,9 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    ninfer::EngineSnapshot previous = service_->snapshot();
     Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const auto interval = std::chrono::milliseconds(options_.launch.logging.stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
 
     for (;;) {
@@ -307,9 +302,9 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
+        const ninfer::EngineSnapshot current = service_->snapshot();
+        const Clock::time_point now          = Clock::now();
+        const ThroughputReport report        = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
         if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
@@ -319,9 +314,9 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
-    const Clock::time_point now        = Clock::now();
-    ThroughputReport tail              = make_throughput_report(
+    const ninfer::EngineSnapshot current = service_->snapshot();
+    const Clock::time_point now          = Clock::now();
+    ThroughputReport tail                = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
     // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
     // fixed-cadence operational record and deliberately has no irregular shutdown tail.
@@ -432,6 +427,7 @@ void HttpServer::register_routes() {
             }
         });
 
+    register_monitor_routes();
     server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
         const bool available = service_ != nullptr && service_->is_available();
         res.status           = available ? 200 : 503;
@@ -442,9 +438,9 @@ void HttpServer::register_routes() {
         handle_models(req, res);
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
-        const auto stats = service_->runtime_stats();
+        const auto stats = observations_.normalize(service_->snapshot());
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(stats, service_->is_available()),
+        res.set_content(metrics_.render(stats, observations_.snapshot(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
@@ -491,8 +487,8 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     service_->supports_tools()),
+    res.set_content(make_models_list(public_model_id_, unix_time_now(),
+                                    options_.launch.engine.max_context, service_->supports_tools()),
                     "application/json");
 }
 
@@ -507,8 +503,8 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      service_->supports_tools()),
+    res.set_content(make_model_object(public_model_id_, unix_time_now(),
+                                    options_.launch.engine.max_context, service_->supports_tools()),
                     "application/json");
 }
 
@@ -518,15 +514,18 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
-    // memory_summary waits for the completed worker boundary, including warmup publication.
-    const ninfer::MemorySummary memory  = service.memory_summary();
-    const ninfer::RuntimeStats baseline = service.runtime_stats();
-    public_model_id_                    = resolve_public_model_id(options_, load.model_name);
-    service_                            = &service;
-    metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
-    request_jsonl_.write_server_start(options_, service.engine_options(),
-                                      service.sampling_defaults(), public_model_id_, load, memory);
+    const ninfer::LoadSummary load = service.startup_report().load;
+    if (!options_.model_id_override && load.model_name.empty()) {
+        throw std::logic_error("loaded artifact model name must not be empty");
+    }
+    public_model_id_ = options_.model_id_override.value_or(load.model_name);
+    service_         = &service;
+    observations_.attach(service.snapshot());
+    metrics_.configure(public_model_id_, service.engine_options(), service.startup_report(),
+                       observations_.start_seconds());
+    request_jsonl_.write_server_start(
+        options_, service.engine_options(), service.sampling_defaults(), public_model_id_,
+        service.description(), service.startup_report(), service.snapshot());
 }
 
 bool HttpServer::listen() {
@@ -534,20 +533,25 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
+    if (options_.launch.logging.stats_interval_ms != 0) {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
     try {
         const bool result = server_.listen_after_bind();
+        observations_.stop();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        observations_.stop();
         stop_stats_reporter();
         throw;
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    observations_.stop();
+    server_.stop();
+}
 
 } // namespace ninfer::serve
