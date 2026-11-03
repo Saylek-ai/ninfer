@@ -63,9 +63,10 @@ saturation does not make the Engine unavailable. The endpoint remains unauthenti
 
 `chat_template_caps.supports_tools` on each model object is llama.cpp's tool-support field, settled
 once at load. It is true when a probe tool declared through the model's chat template reaches the
-prompt and an assistant turn calling it, cut at the model's stop token, decodes through the Qwen
-tool-call decoder as that one call. A template that drops either half, writes calls in another
-syntax, or cannot render tools reports false; that model's tool calls would come back as text.
+prompt and an assistant turn calling it, cut at the model's stop token, decodes through the
+model's own tool-call decoder (Qwen's, or GLM5Next's) as that one call. A template that drops
+either half, writes calls in another syntax, or cannot render tools reports false; that model's
+tool calls would come back as text.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
