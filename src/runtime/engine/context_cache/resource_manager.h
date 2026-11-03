@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/host_placement.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
@@ -64,14 +63,6 @@ public:
         std::optional<std::uint64_t> gain_limit;
         std::uint64_t sacrificed = 0;
         ReclaimRights rights;
-    };
-
-    // What a Host write needs before it can reserve: placement of every run once the chosen
-    // victims are deleted, or, for an Engine shortage, that many bytes freed. A run needs the
-    // arena's placement answer; the free byte total never decides it.
-    struct HostNeed {
-        std::span<const HostAllocationRun> runs;
-        std::size_t shortage = 0;
     };
 
     struct SourceChoice {
@@ -505,17 +496,13 @@ public:
                  const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
         prune(program);
         Evaluation evaluation;
-        const auto usage = program.physical_usage();
-        if (bytes > usage.capacity.host_bytes) { return std::nullopt; }
-        const auto free = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const HostNeed need{.shortage = bytes > free ? bytes - free : 0};
         if (decision) {
-            return host_victims_in_order(program, need, incoming, later_snapshots, excluded,
+            return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded,
                                          decision->admission, *decision, evaluation);
         }
         auto cursor   = reclaim_order(program);
         cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
-        return host_victims_in_order(program, need, incoming, later_snapshots, excluded, admission,
+        return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded, admission,
                                      cursor, evaluation);
     }
 
@@ -559,8 +546,8 @@ public:
         if (shortage.host_bytes) {
             Evaluation evaluation;
             const auto victims =
-                host_victims_in_order(program, {.shortage = shortage.host_bytes}, std::nullopt, {},
-                                      excluded, cursor.admission, cursor, evaluation);
+                host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
+                                      cursor.admission, cursor, evaluation, true);
             if (!victims) { return ReclaimProgress::Blocked; }
             commit_release(program, *victims, cursor);
             return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
@@ -578,14 +565,14 @@ public:
             ActionRank rank;
         };
 
+        const auto usage     = program.physical_usage();
+        const auto free_host = usage.capacity.host_bytes - usage.occupied.host_bytes;
         const bool needs_host_cleanup =
-            std::any_of(plans.demotions.begin(), plans.demotions.end(), [&](const auto& plan) {
-                return plan.host_run.count != 0 &&
-                       !program.host_can_place(std::span(&plan.host_run, 1), {});
-            });
+            std::any_of(plans.demotions.begin(), plans.demotions.end(),
+                        [&](const auto& plan) { return plan.host_bytes > free_host; });
         const bool existing_host_destination =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [](const auto& plan) { return plan.host_run.count == 0; });
+                        [](const auto& plan) { return plan.host_bytes == 0; });
         // Redundant-replica cleanup is a distinct capacity change. Quotes below are read
         // only and never observe side effects from evaluating another candidate.
         if (needs_host_cleanup && !existing_host_destination &&
@@ -607,9 +594,9 @@ public:
                                      plan.sources.end());
             auto preservation =
                 preservation_admission(program, plan.sources, cursor, facts.priority);
-            auto victims = host_victims_in_order(program, {.runs = std::span(&plan.host_run, 1)},
-                                                 preservation.checkpoint, {}, protected_sources,
-                                                 preservation, cursor, evaluation);
+            auto victims =
+                host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
+                                      protected_sources, preservation, cursor, evaluation);
             if (!victims) { continue; }
             auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
             auto host_facts = action_facts(program, *victims, cursor, evaluation);
@@ -684,10 +671,9 @@ public:
                 auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
-                const auto current =
-                    host_victims_in_order(program, {.runs = std::span(&plan.host_run, 1)},
-                                          action.preservation->checkpoint, {}, protected_sources,
-                                          action.preservation, cursor, evaluation);
+                const auto current = host_victims_in_order(
+                    program, plan.host_bytes, action.preservation->checkpoint, {},
+                    protected_sources, action.preservation, cursor, evaluation);
                 if (!current || *current != action.host_victims) { continue; }
                 commit_release(program, action.host_victims, cursor, action.rank.loss);
                 if (program.start_demote(plan)) {
@@ -1304,32 +1290,15 @@ private:
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims_in_order(Program& program, HostNeed need, std::optional<Handle> incoming,
+    host_victims_in_order(Program& program, std::size_t bytes, std::optional<Handle> incoming,
                           std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
                           std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation) const {
-        // A byte shortage is met by bytes; a placement need is met only when the arena places
-        // every run once the selected victims are gone. The selection grows by bytes released,
-        // so it ends when nothing more can be freed even if placement never became possible.
-        const auto satisfied = [&](std::span<const Handle> deleted) {
-            return need.shortage ? program.host_bytes_released(deleted) >= need.shortage
-                                 : program.host_can_place(need.runs, deleted);
-        };
-        if (satisfied({})) { return std::vector<Handle>{}; }
+                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
         const auto usage    = program.physical_usage();
-        const auto required = need.shortage ? need.shortage : total_bytes(need.runs);
-        if (!need.shortage && required > usage.capacity.host_bytes) { return std::nullopt; }
-        // Ranking benefit is capped by the byte deficit when there is one, as it was before
-        // placement decided room. When the bytes already suffice and only placement fails, the
-        // cap is one allocation of the largest run, the hole the write is missing; the whole
-        // write size would reward victims that free more than necessary.
         const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const auto deficit  = required > free ? required - free : 0;
-        std::size_t largest = 0;
-        for (const auto& run : need.runs) {
-            if (run.count) { largest = std::max(largest, run.bytes); }
-        }
-        const auto benefit = need.shortage ? need.shortage : (deficit ? deficit : largest);
+        const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
+        if (!required) { return std::vector<Handle>{}; }
+        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }
         if (!admission && incoming) {
             admission = preservation_admission(
                 program, {&*incoming, 1}, cursor,
@@ -1356,7 +1325,7 @@ private:
         auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
         std::vector<Handle> selected;
         std::size_t released = 0;
-        while (!satisfied(selected)) {
+        while (released < required) {
             std::optional<std::size_t> best;
             std::vector<Handle> best_union;
             std::size_t best_bytes = 0;
@@ -1377,8 +1346,8 @@ private:
                     !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
                     continue;
                 }
-                const auto rank = rank_action(program, combined, facts,
-                                              std::min<std::size_t>(amount, benefit), evaluation);
+                const auto rank            = rank_action(program, combined, facts,
+                                                         std::min<std::size_t>(amount, required), evaluation);
                 std::size_t snapshot_order = 0;
                 for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
                     if (contains(combined, later_snapshots[snapshot])) {
