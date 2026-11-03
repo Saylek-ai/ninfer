@@ -31,6 +31,9 @@ RUN apt-get update \
         cmake \
         curl \
         libcurl4-openssl-dev \
+        libhwloc-dev \
+        libjpeg-dev \
+        liburing-dev \
         meson \
         nasm \
         ninja-build \
@@ -45,11 +48,14 @@ RUN /tmp/build-ffmpeg.sh /opt/ffmpeg \
     && ldconfig
 ENV PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig
 
+# Link against the toolkit stub when the build stage has no host GPU driver.
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1
+
 WORKDIR /src
 COPY . .
 
 RUN cmake -S . -B /build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_TYPE=Release -DNINFER_TARGET=rtx5090 \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
@@ -79,6 +85,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/ninfer-packages.txt /tmp/cuda-keyring.deb
 
 COPY --from=build /dist/bin/ /usr/local/bin/
+COPY --from=build /dist/ninfer-lib/ /usr/local/lib/
 
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \

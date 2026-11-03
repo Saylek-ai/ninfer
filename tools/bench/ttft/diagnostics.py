@@ -8,6 +8,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
+from tools.bench.serve_log import startup_resource_observation
+
+
+REQUEST_LOG_SCHEMA_VERSION = 31
 
 SCHEDULING_FIELDS = (
     "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
@@ -19,20 +23,20 @@ MECHANISM_COUNTERS = {
     "replay_restore": "replay_restores",
 }
 
-TRANSFER_RESOURCES = ("state", "main_kv", "backend_kv")
-TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d")
-OCCUPANCY_FIELDS = (
-    "device_state_slots", "device_main_kv_pages", "device_backend_kv_pages",
-    "host_state_slots", "host_kv_bytes", "host_context_occupied_bytes",
-    "host_context_reserved_bytes",
+TRANSFER_RESOURCES = ("state",)
+TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d", "h2h", "peer_d2d")
+POOL_USAGE_FIELDS = (
+    "capacity_bytes", "block_bytes", "live_bytes", "reserved_bytes",
+    "pending_retirement_bytes", "relocation_bytes", "future_reserved_bytes",
+    "padding_bytes", "assigned_free_bytes", "unassigned_free_bytes", "tail_bytes",
 )
 
 TTFT_STAGES = ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")
 ENGINE_HOST_PHASES = (
-    "engine_boundary", "program_submit", "program_post", "engine_commit_output",
-    "engine_maintenance", "total",
+    "engine_boundary", "session_call", "executor_poll", "engine_commit_output",
+    "engine_maintenance", "executor_flush", "total",
 )
-WORK_PHASES = ("submit", "wait", "post", "gpu")
+WORK_PHASES = ("result", "resolution", "retirement", "total")
 
 
 def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
@@ -56,9 +60,9 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         "engine_elapsed_ms": None,
         **{f"{stage}_{suffix}": None for stage in TTFT_STAGES for suffix in ("ms", "pct")},
         **{f"host_{phase}_ms": None for phase in ENGINE_HOST_PHASES},
-        "device_wait_exposed_ms": None,
+        "scheduler_yield_exposed_ms": None,
         **{f"{work}_{phase}_ms": None for work in ("prefill", "replay")
-           for phase in (*WORK_PHASES, "program")},
+           for phase in WORK_PHASES},
         **{f"{resource}_{direction}_{field}": None for resource in TRANSFER_RESOURCES
            for direction in TRANSFER_DIRECTIONS for field in ("ms", "bytes")},
         **{f"prepare_{field}_ms": None for field in
@@ -130,17 +134,23 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
     host = engine.get("host_exposed_seconds") if isinstance(engine, dict) else None
     for phase in ENGINE_HOST_PHASES:
         row[f"host_{phase}_ms"] = milliseconds(read_seconds(host, phase))
-    row["device_wait_exposed_ms"] = milliseconds(read_seconds(engine, "device_wait_exposed_seconds"))
+    row["scheduler_yield_exposed_ms"] = milliseconds(read_seconds(engine, "scheduler_yield_exposed_seconds"))
     for work in ("prefill", "replay"):
-        timing = first.get(work)
+        timing = first.get(work, {})
         for phase in WORK_PHASES:
-            row[f"{work}_{phase}_ms"] = milliseconds(read_seconds(timing, f"{phase}_seconds"))
-        parts = [row[f"{work}_{phase}_ms"] for phase in ("submit", "wait", "post")]
-        if all(part is not None for part in parts):
-            row[f"{work}_program_ms"] = sum(parts)
+            counter = timing.get(phase, {})
+            elapsed_ns = counter.get("total_ns")
+            row[f"{work}_{phase}_ms"] = (elapsed_ns / 1e6
+                if type(elapsed_ns) is int and elapsed_ns >= 0 else None)
+    pending = first.get("pending_execution")
+    row["pending_result_ms"] = (pending["result_ns"] / 1e6
+        if isinstance(pending, dict) and type(pending.get("result_ns")) is int else None)
     transfers = first.get("context_transfers", {})
-    for resource in TRANSFER_RESOURCES:
-        directions = transfers.get(resource, {}) if isinstance(transfers, dict) else {}
+    resources = {"state": transfers.get("state", {})} if isinstance(transfers, dict) else {}
+    for pool in transfers.get("kv_pools", []) if isinstance(transfers, dict) else []:
+        if isinstance(pool, dict) and type(pool.get("pool_id")) is int:
+            resources[f"kv_pool_{pool['pool_id']}"] = pool.get("transfers", {})
+    for resource, directions in resources.items():
         for direction in TRANSFER_DIRECTIONS:
             transfer = directions.get(direction, {}) if isinstance(directions, dict) else {}
             row[f"{resource}_{direction}_ms"] = milliseconds(read_seconds(transfer, "seconds"))
@@ -158,6 +168,17 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    starts = [event for event in events if event.get("event") == "server_start"]
+    startup = starts[0] if len(starts) == 1 else {}
+    return {
+        **_runtime_interval_observations(events),
+        "startup_resources": startup_resource_observation(startup),
+        "startup_engine": startup.get("engine"),
+        "environment": startup.get("environment"),
+    }
+
+
+def _runtime_interval_observations(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate server-wide interval deltas, independently of per-request attribution."""
     intervals = [event for event in events if event.get("event") == "throughput"]
     if not intervals:
@@ -165,74 +186,111 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     servers = {event.get("server_instance_id") for event in events}
     if len(servers) != 1 or not all(isinstance(server, str) and server for server in servers):
         return {"status": "unavailable", "reason": "ambiguous_server_instance"}
-    if any(event.get("schema_version") not in (23, 24, 25) for event in intervals):
+    if any(event.get("schema_version") != REQUEST_LOG_SCHEMA_VERSION for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
-    def values_at(path: Sequence[str]) -> list[int | float] | None:
+    def values_at(path: Sequence[str | int], sources=intervals) -> list[int | float] | None:
         values = []
-        for event in intervals:
+        for event in sources:
             value: Any = event
             for part in path:
-                value = value.get(part) if isinstance(value, dict) else None
+                if isinstance(value, dict):
+                    value = value.get(part)
+                elif isinstance(value, list) and type(part) is int and 0 <= part < len(value):
+                    value = value[part]
+                else:
+                    value = None
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 return None
             values.append(value)
         return values
 
+    def sampled(path: Sequence[str | int], sources=intervals) -> dict[str, Any]:
+        values = values_at(path, sources)
+        return {
+            "sampled_max": max(values) if values else None,
+            "last": values[-1] if values else None,
+        }
+
     def total(*path: str) -> int | float | None:
         values = values_at(path)
         return sum(values) if values is not None else None
 
-    transfers = {
-        resource: {
-            direction: {
-                field: total("context_cache", f"{resource}_transfers", direction, field)
-                for field in ("bytes", "seconds", "count" if resource == "state" else "pages")
-            }
-            for direction in TRANSFER_DIRECTIONS
+    fields = ("bytes", "seconds", "images", "page_groups", "copy_operations")
+    def transfer_total(*path):
+        return {direction: {field: total(*path, direction, field) for field in fields}
+                for direction in TRANSFER_DIRECTIONS}
+
+    pools = intervals[0].get("context_cache", {}).get("kv_pools", [])
+    transfers = {"state": transfer_total("context_cache", "state_transfers"), "kv_pools": {}}
+    pool_occupancy = {}
+    for index, pool in enumerate(pools):
+        pool_id = pool.get("pool_id")
+        if type(pool_id) is not int or pool_id != index:
+            return {"status": "unavailable", "reason": "invalid_context_pool_directory"}
+        for event in intervals:
+            directory = event.get("context_cache", {}).get("kv_pools", [])
+            if len(directory) != len(pools) or directory[index].get("pool_id") != pool_id:
+                return {"status": "unavailable", "reason": "changed_context_pool_directory"}
+        transfers["kv_pools"][str(pool_id)] = transfer_total("context_cache", "kv_pools", index, "transfers")
+        values = values_at(("context_cache", "kv_pools", index, "occupied_page_groups"))
+        pool_occupancy[str(pool_id)] = {
+            "sampled_max": max(values) if values is not None else None,
+            "last": values[-1] if values is not None else None,
         }
-        for resource in TRANSFER_RESOURCES
-    }
     host_work = {
         group: {field: total("host_work", group, field) for field in fields}
         for group, fields in (
-            ("elapsed_seconds", ("engine_boundary", "program_submit", "program_post",
+            ("elapsed_seconds", ("engine_boundary", "session_call", "executor_poll",
                                  "engine_commit_output", "engine_maintenance", "total")),
-            ("work_class_seconds", ("decode_host", "decode_device_wait", "prefill_host",
-                                    "prefill_device_wait", "control_host", "control_device_wait")),
+            ("work_class_seconds", ("decode_host", "decode_scheduler_yield", "prefill_host",
+                                    "prefill_scheduler_yield", "control_host", "control_scheduler_yield")),
             ("detail_subset_seconds", ("stats_publication",)),
             ("detail_invocations", ("stats_publication",)),
         )
     }
-    host_work["device_wait_seconds"] = total("host_work", "device_wait_seconds")
-    occupancy = {}
-    for field in OCCUPANCY_FIELDS:
-        values = values_at(("context_cache", "occupancy", field))
-        occupancy[field] = {
-            "sampled_max": max(values) if values is not None else None,
-            "last": values[-1] if values is not None else None,
-        }
-    peak = values_at(("context_cache", "occupancy", "host_context_peak_occupied_bytes"))
+    host_work["scheduler_yield_seconds"] = total("host_work", "scheduler_yield_seconds")
+    occupancy = {
+        "kv_pools": pool_occupancy,
+        **{field: sampled(("context_cache", "occupancy", field))
+           for field in ("state_objects", "history_objects")},
+        "metadata": {field: sampled(("context_cache", "occupancy", "metadata", field))
+                     for field in ("budget_bytes", "allocated_bytes", "reserved_bytes")},
+        "pools": [],
+    }
+    physical_pools: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in intervals:
+        seen = set()
+        for pool in event.get("context_cache", {}).get("occupancy", {}).get("pools", []):
+            rank, domain = pool.get("rank"), pool.get("domain")
+            if type(rank) is not int or rank < 0 or domain not in ("device", "host"):
+                return {"status": "unavailable", "reason": "invalid_context_domain"}
+            identity = (rank, domain)
+            if identity in seen:
+                return {"status": "unavailable", "reason": "duplicate_context_domain"}
+            seen.add(identity)
+            physical_pools[identity].append(pool)
+    for (rank, domain), observed in sorted(physical_pools.items()):
+        peaks = values_at(("peak_occupied_bytes",), observed)
+        occupancy["pools"].append({
+            "rank": rank, "domain": domain, "observations": len(observed),
+            **{field: sampled((field,), observed) for field in POOL_USAGE_FIELDS},
+            "peak_occupied_bytes": max(peaks) if peaks else None,
+        })
     final_intervals = [index for index, event in enumerate(intervals)
                        if event.get("final_interval") is True]
     tail_status = (
         "observed" if final_intervals == [len(intervals) - 1]
         else "invalid" if final_intervals else "unconfirmed"
     )
-    starts = [event for event in events if event.get("event") == "server_start"]
-    startup = starts[0] if len(starts) == 1 else {}
     return {
         "status": "available", "server_instance_id": next(iter(servers)),
         "scope": "isolated_server_runtime_intervals", "intervals": len(intervals),
         "reported_interval_seconds": total("interval_seconds"),
         "shutdown_tail": tail_status,
         "transfers": transfers, "host_work": host_work, "occupancy": occupancy,
-        "host_context_peak_occupied_bytes": max(peak) if peak is not None else None,
         "scheduling": {field: total("scheduling", field) for field in
                        ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
-        "startup_memory": startup.get("memory"),
-        "startup_engine": startup.get("engine"),
-        "environment": startup.get("environment"),
     }
 
 
@@ -253,7 +311,7 @@ def _scheduling_observations(
     intervals = []
     incomplete_requests = []
     unavailable = False
-    supported = any(event.get("schema_version") in (24, 25) for event in events)
+    supported = any(event.get("schema_version") == REQUEST_LOG_SCHEMA_VERSION for event in events)
     for request in requests:
         diagnostic = request.get("diagnostics", {})
         engine_id = diagnostic.get("engine_request_id")
@@ -264,6 +322,7 @@ def _scheduling_observations(
             continue
         selected = [event for event in events
                     if event.get("event") == "request_scheduling"
+                    and event.get("schema_version") == REQUEST_LOG_SCHEMA_VERSION
                     and event.get("server_instance_id") == diagnostic.get("server_instance_id")
                     and event.get("engine_request_id") == engine_id
                     and event.get("request", {}).get("request_id") == diagnostic.get("service_request_id")]
@@ -402,7 +461,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
             "matched_by": [field for field, value in wire.items() if value in identities[field]],
         }
         starts = [item for item in events if item.get("event") == "request_start"
-                  and item.get("schema_version") in (23, 24, 25)]
+                  and item.get("schema_version") == REQUEST_LOG_SCHEMA_VERSION]
         preparation = starts[0].get("preparation_seconds") if len(starts) == 1 else None
         identity.update(
             preparation_seconds=preparation,
@@ -418,7 +477,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         scheduling = generation.get("scheduling") if isinstance(generation, dict) else None
         engine_id = generation.get("engine_request_id") if isinstance(generation, dict) else None
         if (
-            event.get("schema_version") not in (23, 24, 25)
+            event.get("schema_version") != REQUEST_LOG_SCHEMA_VERSION
             or type(engine_id) is not int or engine_id <= 0
             or not isinstance(scheduling, dict)
             or any(type(scheduling.get(field)) is not int or scheduling[field] < 0

@@ -1,16 +1,23 @@
 #pragma once
 
 #include "runtime/contract/resources.h"
+#include "runtime/contract/placement.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/prefix_index.h"
 #include "runtime/engine/context_cache/types.h"
+#include "runtime/engine/context_cache/reclaim_selection.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iterator>
+#include <list>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,13 +26,19 @@ namespace ninfer::runtime {
 // Policy owns bounded logical continuations. Native owns checkpoint contents and every byte.
 template <class Model>
 class ResourceManager {
+    friend class ReclaimSelection<ResourceManager>;
 public:
-    using Program    = typename Model::Program;
-    using Base       = typename Model::RequestBasePlan;
-    using Handle     = typename Model::CheckpointHandle;
-    using Source     = typename Model::SourceCandidate;
-    using SessionKey = typename Model::CacheSessionKey;
-    using OwnerToken = ContinuationOwnerToken;
+    using Session           = typename Model::Session;
+    using ResumeState       = typename Model::ResumeState;
+    using ContextDemand     = typename Session::ContextDemand;
+    using ContextAssessment = typename Session::ContextAssessment;
+    using ContextReleaseSet = typename Session::ContextReleaseSet;
+    using Base              = typename Model::RequestBasePlan;
+    using Handle            = typename Model::CheckpointHandle;
+    using HostRequirement   = typename Session::HostRequirement;
+    using Source            = typename Model::SourceCandidate;
+    using SessionKey        = typename Model::CacheSessionKey;
+    using OwnerToken        = ContinuationOwnerToken;
 
     using DemandKey =
         typename decltype(std::declval<const Base&>().prefix_shortlist_key(0))::value_type;
@@ -46,6 +59,7 @@ public:
             Handle handle;
             CacheRetentionPriority priority;
             CacheRetentionPriority demand;
+            SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
         };
 
         struct OwnerProtection {
@@ -56,7 +70,7 @@ public:
         };
 
         // Fixed membership, order and writeback rights for one decision. Native residency
-        // supplies progress; a history may still have other pages needed by a later shortage.
+        // supplies progress; a history may still own records needed by a later demand.
         std::vector<Victim> victims;
         std::vector<OwnerProtection> owners;
         std::optional<Admission> admission;
@@ -67,9 +81,11 @@ public:
 
     struct SourceChoice {
         Source source;
+        std::optional<CheckpointRole> source_role;
         OwnerToken owner           = 0;
         std::uint64_t shared_entry = 0;
         bool take_over             = false;
+        bool private_snapshot      = false;
         std::optional<OwnerToken> resume_owner;
         bool session_hint               = false;
         std::uint64_t publication_order = 0;
@@ -79,15 +95,19 @@ public:
     explicit ResourceManager(bool enabled, ContextMachineCostModel costs)
         : enabled_(enabled), costs_(std::move(costs)) {}
 
+    [[nodiscard]] const PrefixCacheStatistics& statistics() const noexcept {
+        return index_.statistics();
+    }
+
     [[nodiscard]] std::vector<SourceChoice>
-    candidates(Program& program, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
+    candidates(Session& session, const Base& base, std::uint32_t maximum_frontier = UINT32_MAX,
                std::optional<OwnerToken> own_resume = std::nullopt, std::uint64_t request = 0,
-               std::uint64_t publication_order = UINT64_MAX) {
-        prune(program);
+               std::uint64_t publication_order = UINT64_MAX, const ResumeState* resume = nullptr) {
+        prune(session);
         std::vector<SourceChoice> result;
         if (enabled_) {
-            for (const auto handle : index_.matches(program, base)) {
-                if (program.checkpoint_metadata(handle).frontier > maximum_frontier) { continue; }
+            for (const auto handle : index_.matches(session, base)) {
+                if (session.checkpoint_metadata(handle).frontier > maximum_frontier) { continue; }
                 for (const auto& owner : owners_) {
                     const auto point =
                         std::find_if(owner.points.begin(), owner.points.end(),
@@ -118,18 +138,77 @@ public:
                 }
             }
         }
+        if (own_resume) {
+            for (const auto handle : points(*own_resume)) {
+                if (!session.valid_checkpoint(handle) ||
+                    session.checkpoint_metadata(handle).frontier > maximum_frontier) {
+                    continue;
+                }
+                result.push_back({.source            = Source{.checkpoint = handle},
+                                  .owner             = *own_resume,
+                                  .take_over         = true,
+                                  .resume_owner      = own_resume,
+                                  .publication_order = find_owner(*own_resume)->publication_order,
+                                  .ordinal           = *own_resume});
+            }
+        }
+        if (resume && resume->snapshot_handle() &&
+            session.valid_checkpoint(*resume->snapshot_handle()) &&
+            session.checkpoint_metadata(*resume->snapshot_handle()).frontier <= maximum_frontier) {
+            result.push_back({.source       = Source{.checkpoint = resume->snapshot_handle()},
+                              .resume_owner = own_resume});
+        }
         result.push_back({.source = Source{}, .resume_owner = own_resume});
         if (const auto* waiting = find_waiting(request);
             waiting && waiting->choice.source.checkpoint &&
             contains(waiting->held, *waiting->choice.source.checkpoint)) {
             result.push_back(waiting->choice);
         }
-        std::erase_if(
-            result, [&](auto& choice) { return !prepare_source(program, base, choice, request); });
-        const auto cost = [&](const Source& source) {
-            const auto transfer = price_context_transfer_requirements(costs_, source.transfers);
+        std::vector<SourceChoice> expanded;
+        const auto placements = session.placements(base);
+        for (const auto& choice : result) {
+            for (const auto placement : placements) {
+                auto candidate             = choice;
+                candidate.source.placement = placement;
+                if (prepare_source(session, base, candidate, request, std::nullopt, resume)) {
+                    if (candidate.source.checkpoint)
+                        candidate.source_role =
+                            session.checkpoint_metadata(*candidate.source.checkpoint).role;
+                    expanded.push_back(std::move(candidate));
+                }
+            }
+        }
+        result              = std::move(expanded);
+        const auto raw_cost = [&](const Source& source) {
+            const auto transfer = try_price_context_transfer_requirements(costs_, source.transfers);
             const auto prefill  = costs_.prefill_ns(source.remaining_work);
-            return transfer > UINT64_MAX - prefill ? UINT64_MAX : transfer + prefill;
+            return !transfer || *transfer > UINT64_MAX - prefill ? UINT64_MAX : *transfer + prefill;
+        };
+        const auto remote = [](const Source& source) {
+            return std::any_of(source.transfers.begin(), source.transfers.end(),
+                               [](const auto& transfer) { return transfer.peer.has_value(); });
+        };
+        std::vector<std::pair<PlacementId, std::uint64_t>> local_costs;
+        for (const auto placement : placements) {
+            std::uint64_t best = UINT64_MAX;
+            for (const auto& choice : result) {
+                if (choice.source.placement == placement && !remote(choice.source)) {
+                    best = std::min(best, raw_cost(choice.source));
+                }
+            }
+            local_costs.emplace_back(placement, best);
+        }
+        const auto cost = [&](const Source& source) {
+            const auto price = raw_cost(source);
+            if (!remote(source)) { return price; }
+            if (!costs_.prefill_measured || price == UINT64_MAX) { return UINT64_MAX; }
+            const auto local =
+                std::find_if(local_costs.begin(), local_costs.end(),
+                             [&](const auto& entry) { return entry.first == source.placement; });
+            if (local == local_costs.end() || local->second == UINT64_MAX) { return price; }
+            // Only measured immediate savings justify an optional peer copy. A remote source
+            // remains available when local plans cannot reserve the required context.
+            return price < local->second ? price : UINT64_MAX;
         };
         const auto bytes = [](const Source& source) {
             std::uint64_t total = 0;
@@ -161,8 +240,11 @@ public:
             const auto duplicate =
                 std::any_of(unique.begin(), unique.end(), [&](const auto& prior) {
                     return prior.source.checkpoint == choice.source.checkpoint &&
+                           prior.source.placement == choice.source.placement &&
                            prior.source.consume_source == choice.source.consume_source &&
-                           prior.source.private_points == choice.source.private_points;
+                           prior.source.take_private == choice.source.take_private &&
+                           prior.source.private_points == choice.source.private_points &&
+                           prior.source.retired_points == choice.source.retired_points;
                 });
             if (!duplicate) { unique.push_back(std::move(choice)); }
         }
@@ -171,11 +253,12 @@ public:
 
     // Evaluation grants consumption rights but does not retire anything. Native checks the
     // complete binding before applying these grants in its ownership handoff.
-    [[nodiscard]] bool prepare_source(Program& program, const Base& base, SourceChoice& choice,
+    [[nodiscard]] bool prepare_source(Session& session, const Base& base, SourceChoice& choice,
                                       std::uint64_t request                   = 0,
-                                      std::optional<ReclaimRights> revocation = std::nullopt) {
+                                      std::optional<ReclaimRights> revocation = std::nullopt,
+                                      const ResumeState* resume               = nullptr) {
         const auto selected = choice.source.checkpoint;
-        if (selected && !program.valid_checkpoint(*selected)) { return false; }
+        if (selected && !session.valid_checkpoint(*selected)) { return false; }
         auto* owner = find_owner(choice.owner);
         if (choice.take_over && (!owner || owner->publication_order != choice.publication_order ||
                                  (owner->active && choice.resume_owner != choice.owner))) {
@@ -183,12 +266,12 @@ public:
         }
         std::vector<Handle> retired;
         if (choice.take_over && selected && owner) {
-            const auto frontier = program.checkpoint_metadata(*selected).frontier;
+            const auto frontier = session.checkpoint_metadata(*selected).frontier;
             for (const auto& point : owner->points) {
-                if (point.handle == *selected || !program.valid_checkpoint(point.handle)) {
+                if (point.handle == *selected || !session.valid_checkpoint(point.handle)) {
                     continue;
                 }
-                const auto summary = program.checkpoint_metadata(point.handle);
+                const auto summary = session.checkpoint_metadata(point.handle);
                 if (summary.frontier > frontier && !summary.leased &&
                     consumable(point.handle, owner->token, request, revocation)) {
                     retired.push_back(point.handle);
@@ -197,25 +280,32 @@ public:
         }
         auto carried = points(choice.resume_owner.value_or(choice.owner));
         if (const auto* waiting = find_waiting(request);
-            waiting && waiting->choice.source.checkpoint == selected) {
+            waiting && waiting->choice.source.checkpoint == selected &&
+            waiting->choice.source.placement == choice.source.placement) {
             carried = waiting->choice.source.private_points;
             std::erase_if(carried, [&](auto point) { return !contains(waiting->held, point); });
         }
         const auto private_owner =
             choice.resume_owner.value_or(choice.take_over ? choice.owner : 0);
-        const bool consume = selected && consumable(*selected, private_owner, request, revocation);
-        auto inspected     = program.inspect_source(base, selected, consume, carried, retired);
+        const bool private_snapshot = resume && selected && resume->snapshot_handle() == selected;
+        const bool consume = selected && (private_snapshot || consumable(*selected, private_owner,
+                                                                         request, revocation));
+        auto inspected     = session.inspect_source(base, selected, consume, carried, retired,
+                                                    choice.source.placement, resume);
         if (!inspected) { return false; }
         inspected->take_private =
             std::all_of(inspected->private_points.begin(), inspected->private_points.end(),
                         [&](auto point) { return consumable(point, private_owner, request); });
-        choice.source = std::move(*inspected);
+        choice.source           = std::move(*inspected);
+        choice.private_snapshot = private_snapshot;
         return true;
     }
 
-    void retain_source(Program& program, std::uint64_t request, const SourceChoice& choice) {
+    void retain_source(Session& session, std::uint64_t request, const SourceChoice& choice) {
         std::vector<Handle> held;
-        if (choice.source.checkpoint) { held.push_back(*choice.source.checkpoint); }
+        if (choice.source.checkpoint && !choice.private_snapshot) {
+            held.push_back(*choice.source.checkpoint);
+        }
         for (const auto point : choice.source.private_points) {
             if (!contains(held, point)) { held.push_back(point); }
         }
@@ -228,7 +318,7 @@ public:
         auto old        = std::move(waiting->held);
         waiting->choice = choice;
         waiting->held   = std::move(held);
-        for (const auto point : old) { release_unreferenced(program, point); }
+        for (const auto point : old) { release_unreferenced(session, point); }
     }
 
     [[nodiscard]] std::optional<SourceChoice> retained_source(std::uint64_t request) const {
@@ -268,25 +358,30 @@ public:
         }
     }
 
-    void release_source(Program& program, std::uint64_t request) {
+    void release_source(Session& session, std::uint64_t request) {
         const auto found = std::find_if(waiting_.begin(), waiting_.end(), [=](const auto& entry) {
             return entry.request == request;
         });
         if (found == waiting_.end()) { return; }
         auto held = std::move(found->held);
         waiting_.erase(found);
-        for (const auto handle : held) { release_unreferenced(program, handle); }
+        for (const auto handle : held) { release_unreferenced(session, handle); }
     }
 
     // Called exactly once after Native's irreversible bind commit. The choice preserves logical
     // ownership even when Native consumed its original checkpoint handle during that commit.
-    [[nodiscard]] OwnerToken adopt(Program& program, const SourceChoice& choice, const Base& base,
-                                   std::uint64_t publication_order,
+    [[nodiscard]] OwnerToken adopt(Session& session, const SourceChoice& choice, const Base& base,
+                                   std::uint64_t publication_order, bool resuming,
                                    std::span<const Handle> carried = {},
                                    std::span<const Handle> retired = {}) {
+        if (!resuming) {
+            ++request_epoch_;
+            if (choice.source_role && choice.source.reused_tokens)
+                index_.record_adoption(*choice.source_role, choice.source.reused_tokens);
+        }
         for (const auto handle : retired) { forget(handle); }
         if (!enabled_ || !base.summary().publish_continuation) {
-            for (const auto handle : carried) { release_unreferenced(program, handle); }
+            for (const auto handle : carried) { release_unreferenced(session, handle); }
             return 0;
         }
         OwnerToken token = 0;
@@ -296,14 +391,13 @@ public:
             token = *choice.resume_owner;
             if (!find_owner(token)) { throw std::logic_error("resume lost continuation owner"); }
         } else {
-            if (choice.source.reused_tokens) {
-                const auto used_at = ++clock_;
+            if (!resuming && choice.source.reused_tokens) {
+                const auto used_at = request_epoch_;
                 if (const auto key = base.prefix_shortlist_key(choice.source.reused_tokens)) {
-                    remember_demand(*key, 0,
-                                    CacheRetentionPriority{.reused = true, .last_demand = used_at});
+                    remember_demand(*key, 0, CacheRetentionPriority{.last_demand = used_at});
                 }
                 if (auto* owner = find_owner(choice.owner)) {
-                    priority        = {.reused = true, .last_demand = used_at};
+                    priority        = {.last_demand = used_at};
                     proven_frontier = choice.source.reused_tokens;
                     // Consuming a branch replaces its proof. A shallower independent
                     // Fork has its own new evidence and leaves its donor's pair intact.
@@ -313,7 +407,7 @@ public:
                     }
                     if (choice.take_over) { token = owner->token; }
                 } else if (auto* shared = find_shared(choice.shared_entry)) {
-                    shared->priority = {.reused = true, .last_demand = used_at};
+                    shared->priority = {.last_demand = used_at};
                 }
             }
             if (!token) {
@@ -321,43 +415,64 @@ public:
                 owners_.push_back({.token           = token,
                                    .priority        = priority,
                                    .proven_frontier = proven_frontier,
-                                   .retained_at     = ++clock_});
+                                   .retained_at     = ++retention_clock_});
             }
         }
         auto* owner              = find_owner(token);
         owner->active            = true;
         owner->publication_order = publication_order;
-        replace_points(program, *owner, carried);
-        prune(program);
-        balance_reused(program);
+        replace_points(session, *owner, carried);
+        prune(session);
         return token;
     }
 
-    void publish(Program& program, OwnerToken token, Handle handle) {
-        if (!program.valid_checkpoint(handle)) { return; }
-        const auto summary = program.checkpoint_metadata(handle);
+    void publish(Session& session, OwnerToken token, Handle handle) {
+        if (!session.valid_checkpoint(handle)) { return; }
+        const auto summary = session.checkpoint_metadata(handle);
         if (!enabled_ || !token) {
-            release_unreferenced(program, handle);
+            release_unreferenced(session, handle);
             return;
         }
         if (summary.role == CheckpointRole::SharedPrefix) {
-            if (std::none_of(shared_.begin(), shared_.end(),
-                             [&](const auto& entry) { return entry.handle == handle; })) {
-                shared_.push_back(
-                    {.handle   = handle,
-                     .ordinal  = ++ordinal_,
-                     .priority = demand_priority(program.checkpoint_key(handle, summary.frontier)),
-                     .retained_at = ++clock_});
-                index_.insert(program, handle, summary.frontier);
+            for (auto& entry : shared_) {
+                if (entry.handle == handle) return;
+                const auto prior = session.checkpoint_metadata(entry.handle);
+                if (prior.placement != summary.placement || prior.frontier != summary.frontier ||
+                    session.checkpoint_key(entry.handle, prior.frontier) !=
+                        session.checkpoint_key(handle, summary.frontier))
+                    continue;
+                auto identities = session.evaluate_recovery({});
+                if (!identities.prefix(entry.handle, handle)) continue;
+                entry.evidence |= summary.evidence;
+                const auto cost = [&](Handle h) {
+                    return price_context_transfer_requirements(
+                        costs_, session.checkpoint_restore_requirements(h));
+                };
+                if (prior.leased || cost(entry.handle) <= cost(handle)) {
+                    release_unreferenced(session, handle);
+                    return;
+                }
+                const auto old = entry.handle;
+                entry.handle   = handle;
+                index_.insert(session, handle, summary.frontier, summary.role);
+                release_unreferenced(session, old);
+                return;
             }
+            shared_.push_back(
+                {.handle      = handle,
+                 .ordinal     = ++ordinal_,
+                 .priority    = demand_priority(session.checkpoint_key(handle, summary.frontier)),
+                 .retained_at = ++retention_clock_,
+                 .evidence    = summary.evidence});
+            index_.insert(session, handle, summary.frontier, summary.role);
         } else {
             auto* owner = find_owner(token);
             if (!owner) {
                 throw std::logic_error("checkpoint publication lost continuation owner");
             }
-            const auto observed = demand_priority(program.checkpoint_key(handle, summary.frontier));
-            if (summary.role == CheckpointRole::InputReplay && observed.reused &&
-                (!owner->priority.reused || observed.last_demand > owner->priority.last_demand)) {
+            const auto observed = demand_priority(session.checkpoint_key(handle, summary.frontier));
+            if (summary.role == CheckpointRole::InputReplay && observed.reused() &&
+                (!owner->priority.reused() || observed.last_demand > owner->priority.last_demand)) {
                 owner->priority        = observed;
                 owner->proven_frontier = summary.frontier;
             }
@@ -374,24 +489,42 @@ public:
                     }
                     ++anchors;
                     if (!oldest_anchor) { oldest_anchor = point.handle; }
-                    if (program.checkpoint_metadata(point.handle).frontier == summary.frontier) {
+                    if (session.checkpoint_metadata(point.handle).frontier == summary.frontier) {
                         replace = point.handle;
                     }
                 }
                 if (!replace && anchors >= 4) { replace = oldest_anchor; }
-                if (replace && !remove_point(program, *owner, *replace)) {
+                if (replace && !remove_point(session, *owner, *replace)) {
                     // Optional replacement never turns a legitimate request into a failure.
-                    release_unreferenced(program, handle);
+                    release_unreferenced(session, handle);
                     return;
                 }
                 owner->points.push_back({handle, summary.role});
-                index_.insert(program, handle, summary.frontier);
+                index_.insert(session, handle, summary.frontier, summary.role);
             }
         }
-        balance_reused(program);
     }
 
-    void finish(Program& program, OwnerToken token, const Base& base,
+    [[nodiscard]] bool
+    retain_shared_checkpoint(Session& session, const Base& base, std::uint32_t frontier,
+                             PlacementId placement            = {},
+                             SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
+        prune(session);
+        const auto key = base.prefix_shortlist_key(frontier);
+        if (!key) return false;
+        for (auto& entry : shared_) {
+            if (session.checkpoint_metadata(entry.handle).placement == placement &&
+                session.checkpoint_metadata(entry.handle).frontier == frontier &&
+                session.checkpoint_key(entry.handle, frontier) == *key &&
+                session.inspect_source(base, entry.handle, false, {}, {}, placement)) {
+                entry.evidence |= evidence;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void finish(Session& session, OwnerToken token, const Base& base,
                 std::uint64_t publication_order) {
         auto* owner = find_owner(token);
         if (!owner) { return; }
@@ -410,16 +543,15 @@ public:
                 owner->session = advice.session_key;
             }
         }
-        prune(program);
-        balance_reused(program);
+        prune(session);
     }
 
-    void abandon(Program& program, OwnerToken token) {
+    void abandon(Session& session, OwnerToken token) {
         auto* owner = find_owner(token);
         if (!owner) { return; }
         const auto old = points(token);
         std::erase_if(owners_, [&](const auto& entry) { return entry.token == token; });
-        for (const auto handle : old) { release_unreferenced(program, handle); }
+        for (const auto handle : old) { release_unreferenced(session, handle); }
     }
 
     [[nodiscard]] std::vector<Handle> points(OwnerToken token) const {
@@ -432,10 +564,10 @@ public:
 
     [[nodiscard]] CacheRetentionPriority retention(OwnerToken token) const {
         const auto* owner = find_owner(token);
-        return owner ? owner->priority : CacheRetentionPriority{};
+        return owner ? owner->priority.at(request_epoch_) : CacheRetentionPriority{};
     }
 
-    bool recycle_input(Program& program, OwnerToken token) {
+    bool recycle_input(Session& session, OwnerToken token) {
         auto* owner = find_owner(token);
         if (!owner) { return false; }
         const auto point =
@@ -443,19 +575,19 @@ public:
                          [](const auto& p) { return p.role == CheckpointRole::InputReplay; });
         if (point == owner->points.end()) { return false; }
         const auto handle = point->handle;
-        if (program.valid_checkpoint(handle) && program.checkpoint_metadata(handle).leased) {
+        if (session.valid_checkpoint(handle) && session.checkpoint_metadata(handle).leased) {
             return false;
         }
-        return remove_point(program, *owner, handle);
+        return remove_point(session, *owner, handle);
     }
 
     // The caller supplies each request's strictly advancing, non-overlapping committed
     // prefill ranges. Replay and preparation never call this; one candidate is crossed at
     // most once by a request, including when other requests commit between its chunks.
     void observe_committed(const Base& base, std::uint64_t request_id, std::uint32_t begin,
-                           std::uint32_t end) {
+                           std::uint32_t end, std::span<const std::uint32_t> frontiers) {
         if (!enabled_ || begin >= end) { return; }
-        for (const auto frontier : base.capture_frontiers()) {
+        for (const auto frontier : frontiers) {
             if (frontier <= begin || frontier > end) { continue; }
             const auto key = base.prefix_shortlist_key(frontier);
             if (!key) { continue; }
@@ -463,242 +595,258 @@ public:
         }
     }
 
-    [[nodiscard]] Admission capture_admission(Program&, OwnerToken owner, const Base& base,
+    [[nodiscard]] Admission capture_admission(Session&, OwnerToken owner, const Base& base,
                                               std::uint32_t frontier,
                                               bool inherit_private = true) const {
         const auto demand = demand_priority(base.prefix_shortlist_key(frontier));
         // A recurrent continuation's heat can rank its owner, but a new optional point
         // has not itself demonstrated repeat demand. Its added coverage remains bounded.
         auto priority = demand;
-        if (!demand.reused && inherit_private) { priority = retention(owner); }
+        if (!demand.reused() && inherit_private) { priority = retention(owner); }
         return {.priority = priority, .demand = demand, .base = &base, .frontier = frontier};
     }
 
-    [[nodiscard]] ReclaimCursor begin_reclaim(Program& program,
+    [[nodiscard]] ReclaimCursor begin_reclaim(Session& session,
                                               std::optional<Admission> admission = std::nullopt,
                                               ReclaimRights rights               = {}) {
-        prune(program);
-        balance_reused(program);
-        auto cursor      = reclaim_order(program);
+        prune(session);
+        auto cursor      = reclaim_order(session);
         cursor.admission = admission;
         cursor.rights    = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
-        if (admission && !admission->demand.reused) {
-            cursor.gain_limit = recovery_gain(program, *admission, surviving(program, {}));
+        if (admission && !admission->demand.reused()) {
+            Evaluation evaluation;
+            cursor.gain_limit = recovery_gain(session, *admission, {}, evaluation);
         }
         return cursor;
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims(Program& program, std::size_t bytes, std::optional<Handle> incoming,
+    host_victims(Session& session, const HostRequirement& write, std::optional<Handle> incoming,
                  std::span<const Handle> later_snapshots = {},
                  std::span<const Handle> excluded        = {},
                  std::optional<Admission> admission      = std::nullopt,
                  const ReclaimCursor* decision = nullptr, ReclaimRights rights = {}) {
-        prune(program);
+        prune(session);
         Evaluation evaluation;
         if (decision) {
-            return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded,
+            return host_victims_in_order(session, write, incoming, later_snapshots, excluded,
                                          decision->admission, *decision, evaluation);
         }
-        auto cursor   = reclaim_order(program);
+        auto cursor   = reclaim_order(session);
         cursor.rights = admission ? ReclaimRights{ReclaimPurpose::OptionalWrite} : rights;
-        return host_victims_in_order(program, bytes, incoming, later_snapshots, excluded, admission,
+        return host_victims_in_order(session, write, incoming, later_snapshots, excluded, admission,
                                      cursor, evaluation);
     }
 
-    void commit_host_victims(Program& program, std::span<const Handle> handles,
-                             ReclaimCursor& cursor) {
-        commit_release(program, handles, cursor);
+    [[nodiscard]] std::uint64_t release_cost(Session& session,
+                                             std::span<const Handle> handles) const {
+        if (handles.empty()) return 0;
+        Evaluation evaluation;
+        return recovery(session, evaluation).loss(handles);
     }
 
-    bool erase(Program& program, Handle handle, ReclaimRights rights = {}) {
+    void adopt_release(Session& session, std::span<const Handle> handles, ReclaimCursor& cursor,
+                       std::uint64_t loss) {
+        for (const auto handle : handles) {
+            if (session.valid_checkpoint(handle))
+                throw std::logic_error("Session did not consume its quoted cache victim");
+            forget(handle, true);
+        }
+        cursor.sacrificed =
+            loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
+        prune(session);
+    }
+
+    bool erase(Session& session, Handle handle, ReclaimRights rights = {}) {
         if (!references(handle)) { return false; }
         if (!may_revoke({&handle, 1}, rights)) { return false; }
-        if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
+        if (session.valid_checkpoint(handle) && !session.release_checkpoint(handle)) {
             return false;
         }
-        forget(handle);
-        prune(program);
+        forget(handle, true);
+        prune(session);
         return true;
     }
 
-    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
+    [[nodiscard]] ReclaimProgress reclaim(Session& session, const ContextAssessment& assessment,
                                           std::span<const Handle> excluded = {}) {
-        if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
-        auto cursor = begin_reclaim(program);
-        return reclaim(program, shortage, excluded, cursor);
+        if (session.has_context_operation()) return ReclaimProgress::Transferring;
+        auto cursor = begin_reclaim(session);
+        return reclaim(session, assessment, excluded, cursor);
     }
 
-    [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
+    [[nodiscard]] ReclaimProgress reclaim(Session& session, const ContextAssessment& assessment,
                                           std::span<const Handle> excluded, ReclaimCursor& cursor) {
-        if (program.has_context_transaction()) { return ReclaimProgress::Transferring; }
-        prune(program);
-        if (shortage.host_bytes && program.release_redundant_host(excluded)) {
-            return ReclaimProgress::Changed;
+        if (session.has_context_operation()) return ReclaimProgress::Transferring;
+        if (assessment.waiting()) return ReclaimProgress::Deferred;
+        const auto current = session.assess(assessment.demand);
+        if (current.ready()) return ReclaimProgress::Retry;
+        if (current.requires_maintenance()) {
+            const auto started = session.start_maintenance(current);
+            if (started == ContextStart::Started)
+                return session.has_context_operation() ? ReclaimProgress::Transferring
+                                                       : ReclaimProgress::Changed;
+            return started == ContextStart::Deferred ? ReclaimProgress::Deferred
+                                                     : ReclaimProgress::Retry;
         }
+        if (current.waiting()) return ReclaimProgress::Deferred;
+        if (current.impossible()) return ReclaimProgress::Blocked;
+        prune(session);
         std::vector<Handle> allowed;
+        const auto referenced = referenced_handles(session);
         for (const auto& victim : cursor.victims) {
-            if (references(victim.handle) && program.valid_checkpoint(victim.handle) &&
-                !contains(excluded, victim.handle)) {
+            if (session.valid_checkpoint(victim.handle) && referenced[victim.handle.index] &&
+                !contains(excluded, victim.handle))
                 allowed.push_back(victim.handle);
-            }
         }
-        if (shortage.host_bytes) {
-            Evaluation evaluation;
-            const auto victims =
-                host_victims_in_order(program, shortage.host_bytes, std::nullopt, {}, excluded,
-                                      cursor.admission, cursor, evaluation, true);
-            if (!victims) { return ReclaimProgress::Blocked; }
-            commit_release(program, *victims, cursor);
-            return victims->empty() ? ReclaimProgress::Blocked : ReclaimProgress::Changed;
-        }
-        auto plans = program.plan_reclaim(allowed, excluded, shortage);
-        Evaluation evaluation{.native = &plans};
+        auto plans = session.plan_reclaim(allowed, excluded, current.demand);
+        Evaluation evaluation;
         using Demotion = typename decltype(plans.demotions)::value_type;
-        using Release  = typename decltype(plans.releases)::value_type;
 
         struct Action {
-            std::optional<Demotion> demotion;
-            std::optional<Release> release;
+            Demotion demotion;
             std::vector<Handle> host_victims;
-            std::optional<Admission> preservation;
+            Admission preservation;
             ActionRank rank;
         };
 
-        const auto usage     = program.physical_usage();
-        const auto free_host = usage.capacity.host_bytes - usage.occupied.host_bytes;
         const bool needs_host_cleanup =
-            std::any_of(plans.demotions.begin(), plans.demotions.end(),
-                        [&](const auto& plan) { return plan.host_bytes > free_host; });
+            std::any_of(plans.demotions.begin(), plans.demotions.end(), [&](const auto& plan) {
+                return !session.can_place_host(session.demotion_host_requirements(plan));
+            });
         const bool existing_host_destination =
             std::any_of(plans.demotions.begin(), plans.demotions.end(),
                         [](const auto& plan) { return plan.host_bytes == 0; });
-        // Redundant-replica cleanup is a distinct capacity change. Quotes below are read
-        // only and never observe side effects from evaluating another candidate.
         if (needs_host_cleanup && !existing_host_destination &&
-            program.release_redundant_host(excluded)) {
+            session.release_redundant_host(excluded))
             return ReclaimProgress::Changed;
-        }
 
         std::vector<Action> actions;
-        actions.reserve(plans.demotions.size() + plans.releases.size());
+        actions.reserve(plans.demotions.size());
         for (auto& plan : plans.demotions) {
-            const auto units = useful(plan.released, shortage);
-            if (!units) { continue; }
-            auto facts = action_facts(program, plan.sources, cursor, evaluation);
-            if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation, true)) {
+            const auto bytes = session.released_bytes(plan.released, current);
+            if (!bytes) continue;
+            auto facts = action_facts(session, plan.sources, cursor, evaluation);
+            if (!admits(session, plan.sources, facts, cursor.admission, cursor, evaluation, true))
                 continue;
-            }
             auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
             protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                      plan.sources.end());
             auto preservation =
-                preservation_admission(program, plan.sources, cursor, facts.priority);
+                preservation_admission(session, plan.sources, cursor, facts.priority);
+            auto host = session.demotion_host_requirements(plan);
             auto victims =
-                host_victims_in_order(program, plan.host_bytes, preservation.checkpoint, {},
-                                      protected_sources, preservation, cursor, evaluation);
-            if (!victims) { continue; }
-            auto rank       = rank_action(program, plan.sources, facts, units, evaluation, true);
-            auto host_facts = action_facts(program, *victims, cursor, evaluation);
-            const auto host_rank = rank_action(program, *victims, host_facts, units, evaluation);
+                host_victims_in_order(session, host, preservation.checkpoint, {}, protected_sources,
+                                      preservation, cursor, evaluation);
+            if (!victims) continue;
+            const auto useful = session.useful_release_bytes(plan.released, current);
+            auto rank         = rank_action(session, plan.sources, facts, useful, evaluation, true);
+            auto host_facts   = action_facts(session, *victims, cursor, evaluation);
+            const auto host_rank = rank_action(session, *victims, host_facts, useful, evaluation);
             rank.loss            = host_rank.loss;
+            rank.explicit_hint   = rank.explicit_hint || host_rank.explicit_hint;
             rank.waiting         = host_rank.waiting;
             rank.order           = std::max(rank.order, host_rank.order);
-            if (host_rank.priority.reused &&
-                (!rank.priority.reused ||
-                 host_rank.priority.last_demand > rank.priority.last_demand)) {
+            if (host_rank.priority.reused() &&
+                (!rank.priority.reused() ||
+                 host_rank.priority.last_demand > rank.priority.last_demand))
                 rank.priority = host_rank.priority;
-            }
             actions.push_back({.demotion     = std::move(plan),
                                .host_victims = std::move(*victims),
                                .preservation = std::move(preservation),
                                .rank         = rank});
         }
-        for (auto& plan : plans.releases) {
-            const auto units = useful(plan.released, shortage);
-            if (!units) { continue; }
-            auto facts = action_facts(program, plan.sources, cursor, evaluation);
-            if (!admits(program, plan.sources, facts, cursor.admission, cursor, evaluation)) {
-                continue;
-            }
-            auto rank = rank_action(program, plan.sources, facts, units, evaluation);
-            actions.push_back({.release = std::move(plan), .rank = rank});
-        }
         std::stable_sort(actions.begin(), actions.end(),
                          [](const auto& a, const auto& b) { return less_rank(a.rank, b.rank); });
-        for (std::size_t index = 0; index < actions.size(); ++index) {
-            const auto& action = actions[index];
-            if (action.demotion) {
-                if (!shortage.state_slots && action.host_victims.empty()) {
-                    // Preserve the ranked action order. Independent KV groups can share
-                    // one transfer transaction while every holder keeps its own rights.
-                    auto builder           = plans.begin_kv_batch(shortage);
-                    std::size_t components = 0;
-                    std::uint64_t released = 0;
-                    const auto needed =
-                        shortage.main_kv_pages ? shortage.main_kv_pages : shortage.backend_kv_pages;
-                    for (std::size_t next = index; next < actions.size() && released < needed;
+        const std::array<const Admission*, 1> admissions{cursor.admission ? &*cursor.admission
+                                                                          : nullptr};
+        ReclaimSelection<ResourceManager> selection(*this, session, current, cursor, evaluation,
+                                                    *plans.inventory, plans.releases, admissions);
+        while (!session.assess(current.demand, selection.released()).feasible()) {
+            const auto next_release = selection.best();
+            if (!actions.empty() &&
+                (!next_release || !less_rank(next_release->rank, actions.front().rank))) {
+                const auto& action = actions.front();
+                // Earlier tentative deletions remain uncommitted. A preservation action
+                // uses the current directory, including all of those surviving sources.
+                auto plan = action.demotion;
+                // Consecutive preservation actions with free Host destinations can share one
+                // native transaction. Stop as soon as the complete demand fits; Host eviction
+                // remains an individually ranked decision.
+                if (action.host_victims.empty()) {
+                    for (std::size_t next = 1;
+                         next < actions.size() &&
+                         !session.assess(current.demand, plan.released).feasible();
                          ++next) {
-                        const auto& candidate = actions[next];
-                        if (!candidate.demotion) {
-                            // These are alternative ways to reclaim physical resources.
-                            // A delete covered by earlier migrations adds no pages to this
-                            // deficit; keep it in actions for failure fallback, not the batch.
-                            if (builder.covers(*candidate.release)) { continue; }
+                        if (!actions[next].host_victims.empty() ||
+                            (next_release && less_rank(next_release->rank, actions[next].rank)))
                             break;
-                        }
-                        if (!candidate.host_victims.empty()) { break; }
-                        if (!builder.append(*candidate.demotion)) { break; }
-                        ++components;
-                        released += useful(candidate.demotion->released, shortage);
-                    }
-                    if (components > 1) {
-                        if (const auto batch = builder.finish()) {
-                            auto facts = action_facts(program, batch->sources, cursor, evaluation);
-                            if (admits(program, batch->sources, facts, cursor.admission, cursor,
-                                       evaluation, true) &&
-                                program.start_demote(*batch)) {
-                                return program.has_context_transaction()
-                                           ? ReclaimProgress::Transferring
-                                           : ReclaimProgress::Changed;
-                            }
-                        }
-                        // A combined reservation may fail without changing any replica.
-                        // The original first action remains the next legal choice.
+                        const std::array parts{plan, actions[next].demotion};
+                        auto combined = session.combine_demotions(parts);
+                        if (!session.can_place_host(session.demotion_host_requirements(combined)))
+                            break;
+                        plan = std::move(combined);
                     }
                 }
-                const auto& plan       = *action.demotion;
+                const auto host        = session.demotion_host_requirements(plan);
                 auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
                 protected_sources.insert(protected_sources.end(), plan.sources.begin(),
                                          plan.sources.end());
-                const auto current = host_victims_in_order(
-                    program, plan.host_bytes, action.preservation->checkpoint, {},
-                    protected_sources, action.preservation, cursor, evaluation);
-                if (!current || *current != action.host_victims) { continue; }
-                commit_release(program, action.host_victims, cursor, action.rank.loss);
-                if (program.start_demote(plan)) {
-                    return program.has_context_transaction() ? ReclaimProgress::Transferring
-                                                             : ReclaimProgress::Changed;
+                const auto victims = host_victims_in_order(
+                    session, host, action.preservation.checkpoint, {}, protected_sources,
+                    action.preservation, cursor, evaluation);
+                if (!victims || *victims != action.host_victims) {
+                    actions.erase(actions.begin());
+                    continue;
                 }
-                if (!action.host_victims.empty()) { return ReclaimProgress::Changed; }
-                continue;
+                if (!may_revoke(action.host_victims, cursor.rights))
+                    throw std::logic_error("demotion lacks Host victim revocation rights");
+                const auto host_assessment = session.assess(session.host_demand(host));
+                if (host_assessment.requires_maintenance()) {
+                    const auto maintenance = session.start_maintenance(host_assessment);
+                    if (maintenance == ContextStart::Started)
+                        return session.has_context_operation() ? ReclaimProgress::Transferring
+                                                               : ReclaimProgress::Changed;
+                    return maintenance == ContextStart::Deferred ? ReclaimProgress::Deferred
+                                                                 : ReclaimProgress::Retry;
+                }
+                const auto started = session.start_demote(plan, action.host_victims);
+                if (started == ContextStart::Started) {
+                    for (const auto victim : action.host_victims) {
+                        if (session.valid_checkpoint(victim))
+                            throw std::logic_error("demotion did not release its Host victims");
+                        forget(victim, true);
+                    }
+                    if (cursor.gain_limit)
+                        cursor.sacrificed = action.rank.loss > UINT64_MAX - cursor.sacrificed
+                                                ? UINT64_MAX
+                                                : cursor.sacrificed + action.rank.loss;
+                    prune(session);
+                    return session.has_context_operation() ? ReclaimProgress::Transferring
+                                                           : ReclaimProgress::Changed;
+                }
+                // A failed preservation does not grant permission to delete its source.
+                return started == ContextStart::Deferred ? ReclaimProgress::Deferred
+                                                         : ReclaimProgress::Retry;
             }
-            // Native quoted every holder required for this actual physical release.
-            commit_release(program, action.release->sources, cursor, action.rank.loss);
-            return ReclaimProgress::Changed;
+            if (!next_release) return ReclaimProgress::Blocked;
+            selection.commit(*next_release);
         }
-        return ReclaimProgress::Blocked;
+        commit_release(session, selection.handles(), cursor, selection.loss());
+        return ReclaimProgress::Changed;
     }
 
-    void release_all(Program& program) noexcept {
-        const auto handles = victims();
+    void release_all(Session& session) noexcept {
+        const auto ranked = ranked_victims(session);
         index_.clear();
         owners_.clear();
         shared_.clear();
         waiting_.clear();
+        demand_lookup_.clear();
         demand_.clear();
-        for (const auto handle : handles) {
-            if (program.valid_checkpoint(handle)) { (void)program.release_checkpoint(handle); }
+        for (const auto& entry : ranked) {
+            if (session.valid_checkpoint(entry.handle))
+                (void)session.release_checkpoint(entry.handle);
         }
     }
 
@@ -780,32 +928,33 @@ private:
 
     void remember_demand(const DemandKey& key, std::uint64_t request_id,
                          std::optional<CacheRetentionPriority> adopted = std::nullopt) {
-        auto found = std::find_if(demand_.begin(), demand_.end(),
-                                  [&](const auto& entry) { return entry.key == key; });
-        if (found != demand_.end()) {
-            if (!adopted && found->request_id == request_id) { return; }
-            found->request_id = request_id;
-            found->priority =
-                adopted.value_or(CacheRetentionPriority{.reused = true, .last_demand = clock_ + 1});
-            if (!adopted) { ++clock_; }
-            found->observed_at = clock_;
+        const auto found = demand_lookup_.find(key);
+        if (found != demand_lookup_.end()) {
+            const auto entry = found->second;
+            if (!adopted && entry->request_id == request_id) return;
+            const bool recent =
+                request_epoch_ - entry->observed_at < CacheRetentionPriority::request_window;
+            entry->request_id  = request_id;
+            entry->priority    = adopted.value_or(recent ? CacheRetentionPriority{request_epoch_}
+                                                         : CacheRetentionPriority{});
+            entry->observed_at = request_epoch_;
+            demand_.splice(demand_.end(), demand_, entry);
             return;
         }
-        if (demand_.size() == kDemandCapacity) {
-            const auto oldest =
-                std::min_element(demand_.begin(), demand_.end(), [](const auto& a, const auto& b) {
-                    return a.observed_at < b.observed_at;
-                });
-            demand_.erase(oldest);
+        if (demand_.size() >= demand_capacity_) {
+            demand_lookup_.erase(demand_.front().key);
+            demand_.pop_front();
         }
-        demand_.push_back({key, request_id, adopted.value_or(CacheRetentionPriority{}), ++clock_});
+        demand_.push_back(
+            {key, request_id, adopted.value_or(CacheRetentionPriority{}), request_epoch_});
+        demand_lookup_.emplace(key, std::prev(demand_.end()));
     }
 
     [[nodiscard]] CacheRetentionPriority demand_priority(std::optional<DemandKey> key) const {
         if (!key) { return {}; }
-        const auto found = std::find_if(demand_.begin(), demand_.end(),
-                                        [&](const auto& entry) { return entry.key == *key; });
-        return found == demand_.end() ? CacheRetentionPriority{} : found->priority;
+        const auto found = demand_lookup_.find(*key);
+        return found == demand_lookup_.end() ? CacheRetentionPriority{}
+                                             : found->second->priority.at(request_epoch_);
     }
 
     struct Point {
@@ -829,6 +978,7 @@ private:
         std::uint64_t ordinal;
         CacheRetentionPriority priority;
         std::uint64_t retained_at;
+        SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
     };
 
     static bool contains(std::span<const Handle> handles, Handle handle) {
@@ -872,9 +1022,9 @@ private:
 
     bool references(Handle handle) const { return reference_count(handle) != 0; }
 
-    bool remove_point(Program& program, Owner& owner, Handle handle) {
-        if (reference_count(handle) == 1 && program.valid_checkpoint(handle) &&
-            !program.release_checkpoint(handle)) {
+    bool remove_point(Session& session, Owner& owner, Handle handle) {
+        if (reference_count(handle) == 1 && session.valid_checkpoint(handle) &&
+            !session.release_checkpoint(handle)) {
             return false;
         }
         std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
@@ -882,8 +1032,8 @@ private:
         return true;
     }
 
-    void forget(Handle handle) {
-        index_.erase(handle);
+    void forget(Handle handle, bool reclaimed = false) {
+        index_.erase(handle, reclaimed);
         for (auto& owner : owners_) {
             std::erase_if(owner.points, [&](const auto& point) { return point.handle == handle; });
         }
@@ -893,34 +1043,35 @@ private:
         }
     }
 
-    void release_unreferenced(Program& program, Handle handle) {
+    void release_unreferenced(Session& session, Handle handle) {
         if (!catalog_reference_count(handle)) { index_.erase(handle); }
         if (references(handle)) { return; }
-        if (program.valid_checkpoint(handle) && !program.release_checkpoint(handle)) {
+        if (session.valid_checkpoint(handle) && !session.release_checkpoint(handle)) {
             throw std::logic_error("Native could not release an unreferenced checkpoint owner");
         }
     }
 
-    void replace_points(Program& program, Owner& owner, std::span<const Handle> carried) {
+    void replace_points(Session& session, Owner& owner, std::span<const Handle> carried) {
         std::vector<Handle> old;
         for (const auto& point : owner.points) { old.push_back(point.handle); }
         owner.points.clear();
         for (const auto handle : carried) {
-            if (!program.valid_checkpoint(handle)) { continue; }
-            const auto summary = program.checkpoint_metadata(handle);
+            if (!session.valid_checkpoint(handle)) { continue; }
+            const auto summary = session.checkpoint_metadata(handle);
             if (summary.role == CheckpointRole::SharedPrefix) {
                 throw std::logic_error("Native carried a public point as a private continuation");
             }
             owner.points.push_back({handle, summary.role});
-            index_.insert(program, handle, summary.frontier);
+            index_.insert(session, handle, summary.frontier, summary.role);
         }
-        for (const auto handle : old) { release_unreferenced(program, handle); }
+        for (const auto handle : old) { release_unreferenced(session, handle); }
     }
 
-    void prune(Program& program) {
+    void prune(Session& session) {
+        demand_capacity_ = std::max<std::size_t>(256, session.checkpoint_extent() * 2);
         std::vector<Handle> stale;
         const auto inspect = [&](Handle handle) {
-            if (!program.valid_checkpoint(handle) && !contains(stale, handle)) {
+            if (!session.valid_checkpoint(handle) && !contains(stale, handle)) {
                 stale.push_back(handle);
             }
         };
@@ -936,99 +1087,84 @@ private:
                       [](const auto& owner) { return !owner.active && owner.points.empty(); });
     }
 
-    CacheRetentionPriority priority_for(Handle handle) const {
-        CacheRetentionPriority result;
-        const auto include = [&](CacheRetentionPriority priority) {
-            if (priority.reused && (!result.reused || priority.last_demand > result.last_demand)) {
-                result = priority;
+    struct RankedVictim {
+        Handle handle;
+        CacheRetentionPriority priority;
+        std::uint64_t age;
+        SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+    };
+
+    std::vector<RankedVictim> ranked_victims(Session& session) const {
+        std::vector<RankedVictim> ranked;
+        std::vector<std::size_t> positions(session.checkpoint_extent(), SIZE_MAX);
+        const auto add = [&](Handle handle, CacheRetentionPriority priority, std::uint64_t age,
+                             SharedCandidateEvidence evidence = SharedCandidateEvidence::None) {
+            if (!session.valid_checkpoint(handle)) return;
+            evidence |= session.checkpoint_metadata(handle).evidence;
+            auto& position = positions[handle.index];
+            if (position == SIZE_MAX) {
+                position = ranked.size();
+                ranked.push_back({handle, priority, age, evidence});
+                return;
             }
+            auto& prior = ranked[position];
+            prior.evidence |= evidence;
+            if ((priority.reused() && !prior.priority.reused()) ||
+                (priority.reused() == prior.priority.reused() &&
+                 (priority.reused() ? priority.last_demand > prior.priority.last_demand
+                                    : age > prior.age)))
+                prior = {handle, priority, age, prior.evidence};
         };
-        for (const auto& owner : owners_) {
-            if (std::any_of(owner.points.begin(), owner.points.end(),
-                            [&](const auto& point) { return point.handle == handle; })) {
-                include(owner.priority);
-            }
-        }
-        for (const auto& shared : shared_) {
-            if (shared.handle == handle) { include(shared.priority); }
-        }
+        for (const auto& owner : owners_)
+            for (const auto& point : owner.points)
+                add(point.handle, owner.priority.at(request_epoch_), owner.retained_at);
+        for (const auto& shared : shared_)
+            add(shared.handle, shared.priority.at(request_epoch_), shared.retained_at,
+                shared.evidence);
+        for (const auto& waiting : waiting_)
+            for (const auto handle : waiting.held) add(handle, {}, waiting.request);
+        std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (a.priority.reused() != b.priority.reused()) return !a.priority.reused();
+            return (a.priority.reused() ? a.priority.last_demand : a.age) <
+                   (b.priority.reused() ? b.priority.last_demand : b.age);
+        });
+        return ranked;
+    }
+
+    std::vector<bool> referenced_handles(Session& session) const {
+        std::vector<bool> result(session.checkpoint_extent());
+        const auto add = [&](Handle h) {
+            if (session.valid_checkpoint(h)) result[h.index] = true;
+        };
+        for (const auto& owner : owners_)
+            for (const auto& point : owner.points) add(point.handle);
+        for (const auto& shared : shared_) add(shared.handle);
+        for (const auto& waiting : waiting_)
+            for (const auto h : waiting.held) add(h);
         return result;
     }
 
-    std::vector<Handle> victims() const {
-        struct Ranked {
-            Handle handle;
-            CacheRetentionPriority priority;
-            std::uint64_t age;
-        };
-
-        std::vector<Ranked> ranked;
-        const auto add = [&](Handle handle, CacheRetentionPriority priority, std::uint64_t age) {
-            const auto it = std::find_if(ranked.begin(), ranked.end(),
-                                         [&](const auto& entry) { return entry.handle == handle; });
-            if (it == ranked.end()) {
-                ranked.push_back({handle, priority, age});
-            } else if ((priority.reused && !it->priority.reused) ||
-                       (priority.reused == it->priority.reused &&
-                        (priority.reused ? priority.last_demand > it->priority.last_demand
-                                         : age > it->age))) {
-                *it = {handle, priority, age};
-            }
-        };
-        for (const auto& owner : owners_) {
-            for (const auto& point : owner.points) {
-                add(point.handle, owner.priority, owner.retained_at);
-            }
-        }
-        for (const auto& shared : shared_) {
-            add(shared.handle, shared.priority, shared.retained_at);
-        }
-        for (const auto& waiting : waiting_) {
-            for (const auto handle : waiting.held) { add(handle, {}, waiting.request); }
-        }
-        std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-            if (a.priority.reused != b.priority.reused) { return !a.priority.reused; }
-            return (a.priority.reused ? a.priority.last_demand : a.age) <
-                   (b.priority.reused ? b.priority.last_demand : b.age);
-        });
-        std::vector<Handle> out;
-        for (const auto& entry : ranked) { out.push_back(entry.handle); }
-        return out;
-    }
-
-    [[nodiscard]] ReclaimCursor reclaim_order(Program& program) const {
+    [[nodiscard]] ReclaimCursor reclaim_order(Session& session) const {
         ReclaimCursor cursor;
-        for (const auto handle : victims()) {
-            const auto frontier = program.checkpoint_metadata(handle).frontier;
-            cursor.victims.push_back({handle, priority_for(handle),
-                                      demand_priority(program.checkpoint_key(handle, frontier))});
+        for (const auto& entry : ranked_victims(session)) {
+            const auto frontier = session.checkpoint_metadata(entry.handle).frontier;
+            cursor.victims.push_back(
+                {entry.handle, entry.priority,
+                 demand_priority(session.checkpoint_key(entry.handle, frontier)), entry.evidence});
         }
-        for (const auto& owner : owners_) {
-            cursor.owners.push_back(
-                {owner.token, owner.priority, owner.proven_frontier, points(owner.token)});
-        }
+        for (const auto& owner : owners_)
+            cursor.owners.push_back({owner.token, owner.priority.at(request_epoch_),
+                                     owner.proven_frontier, points(owner.token)});
         return cursor;
     }
 
-    static std::uint64_t useful(ContextResourceUsage released, ContextResourceUsage shortage) {
-        if (shortage.state_slots) { return std::min(released.state_slots, shortage.state_slots); }
-        if (shortage.main_kv_pages) {
-            return std::min(released.main_kv_pages, shortage.main_kv_pages);
-        }
-        if (shortage.backend_kv_pages) {
-            return std::min(released.backend_kv_pages, shortage.backend_kv_pages);
-        }
-        return std::min(released.host_bytes, shortage.host_bytes);
-    }
-
-    [[nodiscard]] std::vector<Handle> surviving(Program& program,
-                                                std::span<const Handle> removed) const {
+    [[nodiscard]] std::vector<Handle> advertised(Session& session) const {
         // Only advertised entries can replace a future cache lookup. Waiting-only
         // checkpoints remain physical holders, but are not a caller's lookup fallback.
         std::vector<Handle> kept;
+        std::unordered_set<std::uint32_t> seen;
         const auto include = [&](Handle handle) {
-            if (!contains(removed, handle) && program.valid_checkpoint(handle) &&
-                !contains(kept, handle)) {
+            if (session.valid_checkpoint(handle) && seen.insert(handle.index).second) {
                 kept.push_back(handle);
             }
         };
@@ -1039,128 +1175,166 @@ private:
         return kept;
     }
 
-    using NativeReclaimPlan = decltype(std::declval<Program&>().plan_reclaim(
-        std::span<const Handle>{}, std::span<const Handle>{}, ContextResourceUsage{}));
+    using Recovery =
+        decltype(std::declval<Session&>().evaluate_recovery(std::span<const Handle>{}));
+    using HostReleasePlan = decltype(std::declval<Session&>().plan_releases(
+        std::span<const Handle>{}, std::span<const Handle>{}, ContextDemand{}));
 
     // These facts live only until this synchronous evaluation mutates resources or yields.
     // The fixed victim cursor may outlive them; newly published points still count as fallback.
     struct Evaluation {
-        const NativeReclaimPlan* native = nullptr;
         std::optional<std::vector<Handle>> retained;
+        std::optional<Recovery> recovery;
+
+        struct Incoming {
+            const Base* base;
+            std::uint32_t frontier;
+            std::vector<Handle> candidates;
+        };
+
+        std::vector<Incoming> incoming;
+
+        struct Host {
+            std::vector<Handle> allowed;
+            HostReleasePlan plan;
+        };
+
+        std::optional<Host> host;
+
+        struct FactsIndex {
+            struct Entry {
+                std::optional<Handle> handle, removed;
+                CacheRetentionPriority priority;
+                std::size_t order  = 0;
+                bool private_owner = false, explicit_hint = false;
+                std::vector<std::uint32_t> proofs;
+            };
+
+            std::vector<Entry> entries;
+            std::vector<const Owner*> owners;
+            std::vector<std::uint64_t> removed_stamps, proof_stamps;
+            std::uint64_t stamp = 0;
+        };
+
+        std::optional<FactsIndex> facts;
     };
 
     struct ActionFacts {
         CacheRetentionPriority priority;
         std::size_t order = 0;
-        std::optional<std::vector<Handle>> kept;
         std::optional<std::uint64_t> loss;
+        bool explicit_hint = false;
     };
 
-    [[nodiscard]] std::span<const Handle> retained(Program& program, Evaluation& evaluation) const {
-        if (!evaluation.retained) { evaluation.retained = surviving(program, {}); }
+    [[nodiscard]] std::span<const Handle> retained(Session& session, Evaluation& evaluation) const {
+        if (!evaluation.retained) { evaluation.retained = advertised(session); }
         return *evaluation.retained;
     }
 
-    [[nodiscard]] std::uint64_t recovery_loss(Program& program, std::span<const Handle> removed,
-                                              std::span<const Handle> kept,
-                                              const Evaluation& evaluation) const {
-        if (removed.empty()) { return 0; }
-        return evaluation.native ? evaluation.native->recovery_loss(removed, kept)
-                                 : program.checkpoint_recovery_loss(removed, kept);
+    [[nodiscard]] Recovery& recovery(Session& session, Evaluation& evaluation) const {
+        if (!evaluation.recovery)
+            evaluation.recovery.emplace(session.evaluate_recovery(retained(session, evaluation)));
+        return *evaluation.recovery;
     }
 
-    [[nodiscard]] std::span<const Handle> action_survivors(Program& program,
-                                                           std::span<const Handle> sources,
-                                                           ActionFacts& facts,
-                                                           Evaluation& evaluation) const {
-        if (!facts.kept) {
-            facts.kept.emplace();
-            const auto all = retained(program, evaluation);
-            facts.kept->reserve(all.size());
-            for (const auto handle : all) {
-                if (!contains(sources, handle)) { facts.kept->push_back(handle); }
-            }
-        }
-        return *facts.kept;
-    }
-
-    [[nodiscard]] std::uint64_t action_loss(Program& program, std::span<const Handle> sources,
+    [[nodiscard]] std::uint64_t action_loss(Session& session, std::span<const Handle> sources,
                                             ActionFacts& facts, Evaluation& evaluation) const {
         if (!facts.loss) {
-            facts.loss = sources.empty()
-                             ? 0
-                             : recovery_loss(program, sources,
-                                             action_survivors(program, sources, facts, evaluation),
-                                             evaluation);
+            facts.loss = sources.empty() ? 0 : recovery(session, evaluation).loss(sources);
         }
         return *facts.loss;
     }
 
-    [[nodiscard]] CacheRetentionPriority action_priority(Program& program,
-                                                         std::span<const Handle> sources,
-                                                         const ReclaimCursor& cursor,
-                                                         const Evaluation& evaluation) const {
-        CacheRetentionPriority priority;
-        if (sources.empty()) { return priority; }
-        const auto include = [&](CacheRetentionPriority candidate) {
-            if (candidate.reused &&
-                (!priority.reused || candidate.last_demand > priority.last_demand)) {
-                priority = candidate;
+    [[nodiscard]] ActionFacts action_facts(Session& session, std::span<const Handle> sources,
+                                           const ReclaimCursor& cursor,
+                                           Evaluation& evaluation) const {
+        auto& recovery_index = recovery(session, evaluation);
+        if (!evaluation.facts) {
+            auto& data = evaluation.facts.emplace();
+            data.entries.resize(recovery_index.capacity());
+            data.removed_stamps.resize(data.entries.size());
+            data.proof_stamps.resize(cursor.owners.size());
+            for (std::size_t i = 0; i < cursor.victims.size(); ++i) {
+                const auto& victim  = cursor.victims[i];
+                auto& entry         = data.entries[victim.handle.index];
+                entry.handle        = victim.handle;
+                entry.priority      = victim.priority;
+                entry.explicit_hint = has_shared_candidate_evidence(
+                    victim.evidence, SharedCandidateEvidence::ExplicitBoundary);
+                entry.order = i;
             }
-        };
-        for (const auto& victim : cursor.victims) {
-            if (!contains(sources, victim.handle)) { continue; }
-            const auto private_owner =
-                std::any_of(cursor.owners.begin(), cursor.owners.end(), [&](const auto& owner) {
-                    return contains(owner.points, victim.handle);
-                });
-            if (!private_owner) { include(victim.priority); }
+            std::unordered_map<OwnerToken, const Owner*> owners;
+            for (const auto& owner : owners_) owners.emplace(owner.token, &owner);
+            for (std::uint32_t i = 0; i < cursor.owners.size(); ++i) {
+                const auto& proof = cursor.owners[i];
+                const auto found  = owners.find(proof.owner);
+                data.owners.push_back(found == owners.end() ? nullptr : found->second);
+                for (const auto h : proof.points) {
+                    if (h.index >= data.entries.size()) continue;
+                    auto& entry = data.entries[h.index];
+                    if (entry.handle != h) continue;
+                    entry.private_owner = true;
+                    if (proof.priority.reused()) entry.proofs.push_back(i);
+                }
+            }
         }
-        for (const auto& proof : cursor.owners) {
-            if (!proof.priority.reused) { continue; }
-            const auto* owner = find_owner(proof.owner);
-            bool affected     = false;
-            bool covered      = owner != nullptr;
-            for (const auto handle : proof.points) {
-                if (!contains(sources, handle)) { continue; }
-                affected      = true;
-                bool fallback = false;
-                if (owner) {
-                    const auto frontier = program.checkpoint_metadata(handle).frontier;
-                    for (const auto& point : owner->points) {
-                        if (contains(sources, point.handle) ||
-                            !program.valid_checkpoint(point.handle)) {
-                            continue;
-                        }
-                        const auto candidate = program.checkpoint_metadata(point.handle).frontier;
-                        if (candidate < proof.proven_frontier || candidate > frontier) { continue; }
-                        const auto loss =
-                            recovery_loss(program, {&handle, 1}, {&point.handle, 1}, evaluation);
-                        if (loss == frontier - candidate) {
-                            fallback = true;
-                            break;
+        auto& data = *evaluation.facts;
+        ++data.stamp;
+        for (const auto h : sources) {
+            data.entries[h.index].removed = h;
+            data.removed_stamps[h.index]  = data.stamp;
+        }
+        const auto removed = [&](Handle h) {
+            return h.index < data.entries.size() && data.removed_stamps[h.index] == data.stamp &&
+                   data.entries[h.index].removed == h;
+        };
+        ActionFacts facts;
+        const auto include = [&](CacheRetentionPriority value) {
+            if (value.reused() &&
+                (!facts.priority.reused() || value.last_demand > facts.priority.last_demand))
+                facts.priority = value;
+        };
+        for (const auto source : sources) {
+            const auto& entry = data.entries[source.index];
+            if (entry.handle != source) continue;
+            facts.order         = std::max(facts.order, entry.order);
+            facts.explicit_hint = facts.explicit_hint || entry.explicit_hint;
+            if (!entry.private_owner) include(entry.priority);
+            for (const auto i : entry.proofs) {
+                if (data.proof_stamps[i] == data.stamp) continue;
+                data.proof_stamps[i] = data.stamp;
+                const auto& proof    = cursor.owners[i];
+                const auto* owner    = data.owners[i];
+                bool covered         = owner != nullptr;
+                for (const auto h : proof.points) {
+                    if (!removed(h)) continue;
+                    bool fallback = false;
+                    if (owner) {
+                        const auto frontier = recovery_index.frontier(h);
+                        for (const auto& point : owner->points) {
+                            if (removed(point.handle) || !recovery_index.contains(point.handle))
+                                continue;
+                            const auto candidate = recovery_index.frontier(point.handle);
+                            if (candidate >= proof.proven_frontier && candidate <= frontier &&
+                                recovery_index.prefix(point.handle, h)) {
+                                fallback = true;
+                                break;
+                            }
                         }
                     }
+                    covered = covered && fallback;
                 }
-                covered = covered && fallback;
-            }
-            // The hot grant protects already adopted progress. A later exact same-owner
-            // checkpoint can cover that proof while an unproven suffix is reclaimed.
-            if (affected && !covered) { include(proof.priority); }
-        }
-        return priority;
-    }
-
-    [[nodiscard]] ActionFacts action_facts(Program& program, std::span<const Handle> sources,
-                                           const ReclaimCursor& cursor,
-                                           const Evaluation& evaluation) const {
-        ActionFacts facts{.priority = action_priority(program, sources, cursor, evaluation)};
-        if (!sources.empty()) {
-            for (std::size_t i = 0; i < cursor.victims.size(); ++i) {
-                if (contains(sources, cursor.victims[i].handle)) { facts.order = i; }
+                if (!covered) include(proof.priority);
             }
         }
         return facts;
+    }
+
+    [[nodiscard]] CacheRetentionPriority action_priority(Session& session,
+                                                         std::span<const Handle> sources,
+                                                         const ReclaimCursor& cursor,
+                                                         Evaluation& evaluation) const {
+        return action_facts(session, sources, cursor, evaluation).priority;
     }
 
     struct ActionRank {
@@ -1169,34 +1343,34 @@ private:
         std::uint64_t units   = 0;
         std::size_t order     = 0;
         std::uint64_t waiting = 0;
+        bool explicit_hint    = false;
     };
 
-    [[nodiscard]] ActionRank rank_action(Program& program, std::span<const Handle> sources,
+    [[nodiscard]] ActionRank rank_action(Session& session, std::span<const Handle> sources,
                                          ActionFacts& facts, std::uint64_t units,
                                          Evaluation& evaluation, bool preserving = false) const {
-        return {.priority = facts.priority,
-                .loss     = preserving ? 0 : action_loss(program, sources, facts, evaluation),
-                .units    = units,
-                .order    = facts.order,
-                .waiting  = preserving ? 0 : waiting_ticket(sources)};
+        return {.priority      = facts.priority,
+                .loss          = preserving ? 0 : action_loss(session, sources, facts, evaluation),
+                .units         = std::max<std::uint64_t>(1, units),
+                .order         = facts.order,
+                .waiting       = preserving ? 0 : waiting_ticket(sources),
+                .explicit_hint = facts.explicit_hint};
     }
 
     static bool less_rank(const ActionRank& left, const ActionRank& right) {
         if (bool(left.waiting) != bool(right.waiting)) { return !left.waiting; }
         if (left.waiting != right.waiting) { return left.waiting > right.waiting; }
-        if (left.priority.reused != right.priority.reused) { return !left.priority.reused; }
-        if (left.priority.reused && left.priority.last_demand != right.priority.last_demand) {
+        if (left.priority.reused() != right.priority.reused()) { return !left.priority.reused(); }
+        const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
+        const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
+        if (a != b) return a < b;
+        if (left.priority.last_demand != right.priority.last_demand)
             return left.priority.last_demand < right.priority.last_demand;
-        }
-        if (!left.priority.reused) {
-            const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
-            const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
-            if (a != b) { return a < b; }
-        }
+        if (left.explicit_hint != right.explicit_hint) return !left.explicit_hint;
         return left.order < right.order;
     }
 
-    [[nodiscard]] Admission preservation_admission(Program& program,
+    [[nodiscard]] Admission preservation_admission(Session& session,
                                                    std::span<const Handle> sources,
                                                    const ReclaimCursor& cursor,
                                                    CacheRetentionPriority priority) const {
@@ -1204,7 +1378,7 @@ private:
                          .sources  = std::vector<Handle>(sources.begin(), sources.end())};
         std::uint32_t deepest = 0;
         for (const auto handle : sources) {
-            const auto frontier = program.checkpoint_metadata(handle).frontier;
+            const auto frontier = session.checkpoint_metadata(handle).frontier;
             if (!result.checkpoint || frontier > deepest) {
                 result.checkpoint = handle;
                 deepest           = frontier;
@@ -1214,101 +1388,112 @@ private:
                              [&](const auto& victim) { return victim.handle == handle; });
             const auto demand =
                 found == cursor.victims.end() ? CacheRetentionPriority{} : found->demand;
-            if (demand.reused &&
-                (!result.demand.reused || demand.last_demand > result.demand.last_demand)) {
+            if (demand.reused() &&
+                (!result.demand.reused() || demand.last_demand > result.demand.last_demand)) {
                 result.demand = demand;
             }
         }
-        if (result.demand.reused) { result.priority = result.demand; }
+        if (result.demand.reused()) { result.priority = result.demand; }
         return result;
     }
 
-    [[nodiscard]] std::uint64_t recovery_gain(Program& program, const Admission& admission,
-                                              std::span<const Handle> kept,
-                                              const Evaluation& evaluation = {}) const {
-        if (admission.base) {
-            std::uint32_t fallback = 0;
-            for (const auto handle : kept) {
-                fallback = std::max(fallback, program.checkpoint_recovery_frontier(
-                                                  handle, *admission.base, admission.frontier));
-            }
-            return admission.frontier - fallback;
+    [[nodiscard]] const std::vector<Handle>& incoming_candidates(Session& session,
+                                                                 const Admission& admission,
+                                                                 Evaluation& evaluation) const {
+        auto found = std::find_if(
+            evaluation.incoming.begin(), evaluation.incoming.end(), [&](const auto& item) {
+                return item.base == admission.base && item.frontier == admission.frontier;
+            });
+        if (found == evaluation.incoming.end()) {
+            typename Evaluation::Incoming item{admission.base, admission.frontier, {}};
+            for (const auto handle : retained(session, evaluation))
+                if (session.checkpoint_recovery_frontier(handle, *admission.base,
+                                                         admission.frontier))
+                    item.candidates.push_back(handle);
+            auto& index = recovery(session, evaluation);
+            std::sort(item.candidates.begin(), item.candidates.end(),
+                      [&](auto a, auto b) { return index.frontier(a) > index.frontier(b); });
+            evaluation.incoming.push_back(std::move(item));
+            found = std::prev(evaluation.incoming.end());
         }
-        if (admission.checkpoint && program.valid_checkpoint(*admission.checkpoint)) {
+
+        return found->candidates;
+    }
+
+    [[nodiscard]] std::uint64_t recovery_gain(Session& session, const Admission& admission,
+                                              std::span<const Handle> removed,
+                                              Evaluation& evaluation) const {
+        if (admission.base) {
+            const auto& candidates = incoming_candidates(session, admission, evaluation);
+            return admission.frontier -
+                   recovery(session, evaluation).best_remaining(candidates, removed);
+        }
+        if (admission.checkpoint && session.valid_checkpoint(*admission.checkpoint)) {
             auto sources = admission.sources;
             if (sources.empty()) { sources.push_back(*admission.checkpoint); }
-            auto other = std::vector<Handle>(kept.begin(), kept.end());
-            std::erase_if(other, [&](auto handle) { return contains(sources, handle); });
-            return recovery_loss(program, sources, other, evaluation);
+            return recovery(session, evaluation).loss(sources, removed);
         }
         return 0;
     }
 
-    [[nodiscard]] bool admits(Program& program, std::span<const Handle> removed, ActionFacts& facts,
+    static bool admits_limits(CacheRetentionPriority victim, std::uint64_t loss,
+                              const Admission& admission, const ReclaimCursor& cursor) {
+        if (victim.reused() &&
+            (!admission.priority.reused() || victim.last_demand >= admission.priority.last_demand))
+            return false;
+        // The fixed outer budget also covers Host victims of a preservation transfer.
+        return !cursor.gain_limit || (cursor.sacrificed < *cursor.gain_limit &&
+                                      loss < *cursor.gain_limit - cursor.sacrificed);
+    }
+
+    [[nodiscard]] bool admits(Session& session, std::span<const Handle> removed, ActionFacts& facts,
                               const std::optional<Admission>& admission,
                               const ReclaimCursor& cursor, Evaluation& evaluation,
                               bool preserving = false) const {
         if (!preserving && !may_revoke(removed, cursor.rights)) { return false; }
         if (!admission) { return true; }
-        const auto victim = facts.priority;
-        if (victim.reused && (!admission->priority.reused ||
-                              victim.last_demand >= admission->priority.last_demand)) {
-            return false;
-        }
-        const auto loss = preserving ? 0 : action_loss(program, removed, facts, evaluation);
-        // This outer budget also covers Host victims of a preservation transfer. A hot
-        // migration source cannot lend its permissions to the capture that requested space.
-        if (cursor.gain_limit && (cursor.sacrificed >= *cursor.gain_limit ||
-                                  loss >= *cursor.gain_limit - cursor.sacrificed)) {
-            return false;
-        }
-        if (admission->demand.reused) { return true; }
-        const auto kept = preserving ? retained(program, evaluation)
-                                     : action_survivors(program, removed, facts, evaluation);
-        return recovery_gain(program, *admission, kept, evaluation) > loss;
+        const auto loss = preserving ? 0 : action_loss(session, removed, facts, evaluation);
+        if (!admits_limits(facts.priority, loss, *admission, cursor)) return false;
+        if (admission->demand.reused()) { return true; }
+        return recovery_gain(session, *admission, preserving ? std::span<const Handle>{} : removed,
+                             evaluation) > loss;
     }
 
-    void commit_release(Program& program, std::span<const Handle> handles, ReclaimCursor& cursor,
-                        std::optional<std::uint64_t> quoted_loss = std::nullopt) {
+    void commit_release(Session& session, std::span<const Handle> handles, ReclaimCursor& cursor,
+                        std::uint64_t loss) {
         if (handles.empty()) { return; }
         if (!may_revoke(handles, cursor.rights)) {
             throw std::logic_error("cache release lacks waiting-source revocation rights");
         }
-        const auto loss =
-            cursor.gain_limit
-                ? (quoted_loss
-                       ? *quoted_loss
-                       : program.checkpoint_recovery_loss(handles, surviving(program, handles)))
-                : 0;
         for (const auto handle : handles) {
-            if (!erase(program, handle, cursor.rights)) {
+            if (!erase(session, handle, cursor.rights)) {
                 throw std::logic_error("quoted cache release changed before commit");
             }
         }
-        cursor.sacrificed =
-            loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
+        if (cursor.gain_limit)
+            cursor.sacrificed =
+                loss > UINT64_MAX - cursor.sacrificed ? UINT64_MAX : cursor.sacrificed + loss;
     }
 
     [[nodiscard]] std::optional<std::vector<Handle>>
-    host_victims_in_order(Program& program, std::size_t bytes, std::optional<Handle> incoming,
-                          std::span<const Handle> later_snapshots, std::span<const Handle> excluded,
-                          std::optional<Admission> admission, const ReclaimCursor& cursor,
-                          Evaluation& evaluation, bool bytes_are_shortage = false) const {
-        const auto usage    = program.physical_usage();
-        const auto free     = usage.capacity.host_bytes - usage.occupied.host_bytes;
-        const auto required = bytes_are_shortage ? bytes : (bytes > free ? bytes - free : 0);
-        if (!required) { return std::vector<Handle>{}; }
-        if (!bytes_are_shortage && bytes > usage.capacity.host_bytes) { return std::nullopt; }
+    host_victims_in_order(Session& session, const HostRequirement& write,
+                          std::optional<Handle> incoming, std::span<const Handle> later_snapshots,
+                          std::span<const Handle> excluded, std::optional<Admission> admission,
+                          const ReclaimCursor& cursor, Evaluation& evaluation) const {
+        const auto demand     = session.host_demand(write);
+        const auto assessment = session.assess(demand);
+        if (assessment.feasible()) return std::vector<Handle>{};
+        if (assessment.impossible() || assessment.waiting()) return std::nullopt;
         if (!admission && incoming) {
             admission = preservation_admission(
-                program, {&*incoming, 1}, cursor,
-                action_priority(program, {&*incoming, 1}, cursor, evaluation));
+                session, {&*incoming, 1}, cursor,
+                action_priority(session, {&*incoming, 1}, cursor, evaluation));
         }
         std::vector<Handle> allowed;
+        const auto referenced = referenced_handles(session);
         for (const auto& victim : cursor.victims) {
             const auto handle = victim.handle;
-            if (incoming != handle && !contains(excluded, handle) && references(handle) &&
-                program.valid_checkpoint(handle)) {
+            if (session.valid_checkpoint(handle) && referenced[handle.index]) {
                 allowed.push_back(handle);
             }
         }
@@ -1316,135 +1501,30 @@ private:
         // Engine order; ordinary optional writes cannot acquire these rights.
         if (!admission) {
             for (const auto handle : later_snapshots) {
-                if (!contains(excluded, handle) && !contains(allowed, handle) &&
-                    program.valid_checkpoint(handle)) {
+                if (!contains(allowed, handle) && session.valid_checkpoint(handle)) {
                     allowed.push_back(handle);
                 }
             }
         }
-        auto actions = program.plan_releases(allowed, excluded, {.host_bytes = required});
-        std::vector<Handle> selected;
-        std::size_t released = 0;
-        while (released < required) {
-            std::optional<std::size_t> best;
-            std::vector<Handle> best_union;
-            std::size_t best_bytes = 0;
-            ActionRank best_rank;
-            std::size_t best_snapshot_order = 0;
-            for (std::size_t i = 0; i < actions.size(); ++i) {
-                auto combined = selected;
-                for (const auto handle : actions[i].sources) {
-                    if (!contains(combined, handle)) { combined.push_back(handle); }
-                }
-                const auto amount = program.host_bytes_released(combined);
-                if (amount <= released) { continue; }
-                auto facts = action_facts(program, combined, cursor, evaluation);
-                // A migration must satisfy both its own preservation rights and the
-                // optional capture that requested space. Source heat cannot grant the
-                // outer capture permission to erase unrelated hot Host history.
-                if (!admits(program, combined, facts, admission, cursor, evaluation) ||
-                    !admits(program, combined, facts, cursor.admission, cursor, evaluation)) {
-                    continue;
-                }
-                const auto rank            = rank_action(program, combined, facts,
-                                                         std::min<std::size_t>(amount, required), evaluation);
-                std::size_t snapshot_order = 0;
-                for (std::size_t snapshot = 0; snapshot < later_snapshots.size(); ++snapshot) {
-                    if (contains(combined, later_snapshots[snapshot])) {
-                        snapshot_order = snapshot + 1;
-                    }
-                }
-                // Ordinary history is exhausted before Engine-owned paused snapshots.
-                // Snapshot candidates retain the Engine's explicit youngest-first order.
-                if (!best || snapshot_order < best_snapshot_order ||
-                    (snapshot_order == best_snapshot_order && less_rank(rank, best_rank))) {
-                    best                = i;
-                    best_union          = std::move(combined);
-                    best_bytes          = amount;
-                    best_rank           = rank;
-                    best_snapshot_order = snapshot_order;
-                }
-            }
-            if (!best) { return std::nullopt; }
-            selected = std::move(best_union);
-            released = best_bytes;
-            actions.erase(actions.begin() + *best);
+        // Exclusions filter whole physical actions below; they do not change store facts.
+        // All Device candidates and the final Host preflight reuse this synchronous inventory.
+        if (!evaluation.host || evaluation.host->allowed != allowed)
+            evaluation.host.emplace(
+                typename Evaluation::Host{allowed, session.plan_releases(allowed, {}, demand)});
+        const auto& plan       = evaluation.host->plan;
+        auto protected_sources = std::vector<Handle>(excluded.begin(), excluded.end());
+        if (incoming) protected_sources.push_back(*incoming);
+        const std::array<const Admission*, 2> admissions{
+            admission ? &*admission : nullptr, cursor.admission ? &*cursor.admission : nullptr};
+        ReclaimSelection<ResourceManager> selection(*this, session, assessment, cursor, evaluation,
+                                                    *plan.inventory, plan.releases, admissions,
+                                                    protected_sources, later_snapshots);
+        while (!session.can_place_host(write, selection.released())) {
+            const auto next = selection.best();
+            if (!next) return std::nullopt;
+            selection.commit(*next);
         }
-        return selected;
-    }
-
-    void balance_reused(Program& program) {
-        const auto amounts = [](ContextResourceUsage r) {
-            return std::array<std::uint64_t, 4>{r.state_slots, r.main_kv_pages, r.backend_kv_pages,
-                                                r.host_bytes};
-        };
-
-        struct ProtectedEntry {
-            CacheRetentionPriority* priority;
-            std::uint64_t* retained_at;
-            std::uint64_t ordinal;
-            std::vector<Handle> handles;
-            std::optional<std::array<std::uint64_t, 4>> footprint;
-        };
-
-        std::vector<ProtectedEntry> entries;
-        for (auto& owner : owners_) {
-            if (!owner.priority.reused) { continue; }
-            std::vector<Handle> handles;
-            handles.reserve(owner.points.size());
-            for (const auto& point : owner.points) { handles.push_back(point.handle); }
-            entries.push_back(
-                {&owner.priority, &owner.retained_at, owner.token, std::move(handles)});
-        }
-        for (auto& shared : shared_) {
-            if (shared.priority.reused) {
-                entries.push_back(
-                    {&shared.priority, &shared.retained_at, shared.ordinal, {shared.handle}});
-            }
-        }
-        if (entries.empty()) { return; }
-        const auto capacities = amounts(program.physical_usage().capacity);
-        std::vector<Handle> reused;
-        for (;;) {
-            reused.clear();
-            for (const auto& entry : entries) {
-                if (!entry.priority->reused) { continue; }
-                for (const auto handle : entry.handles) {
-                    if (!contains(reused, handle)) { reused.push_back(handle); }
-                }
-            }
-            if (reused.empty()) { return; }
-            // Shared physical objects still count once in the whole protected set.
-            const auto usage       = amounts(program.checkpoint_footprint(reused));
-            ProtectedEntry* demote = nullptr;
-            for (std::size_t resource = 0; resource < usage.size() && !demote; ++resource) {
-                if (usage[resource] <= capacities[resource] * 3ULL / 4ULL) { continue; }
-                ProtectedEntry* newest = nullptr;
-                ProtectedEntry* oldest = nullptr;
-                for (auto& entry : entries) {
-                    if (!entry.priority->reused) { continue; }
-                    // This loop only changes protection priority, never Native contents.
-                    if (!entry.footprint) {
-                        entry.footprint = amounts(program.checkpoint_footprint(entry.handles));
-                    }
-                    if (!(*entry.footprint)[resource]) { continue; }
-                    if (!newest || entry.priority->last_demand > newest->priority->last_demand ||
-                        (entry.priority->last_demand == newest->priority->last_demand &&
-                         entry.ordinal > newest->ordinal)) {
-                        newest = &entry;
-                    }
-                    if (!oldest || entry.priority->last_demand < oldest->priority->last_demand ||
-                        (entry.priority->last_demand == oldest->priority->last_demand &&
-                         entry.ordinal < oldest->ordinal)) {
-                        oldest = &entry;
-                    }
-                }
-                if (oldest != newest) { demote = oldest; }
-            }
-            if (!demote) { return; }
-            demote->priority->reused = false;
-            *demote->retained_at     = ++clock_;
-        }
+        return std::vector<Handle>(selection.handles().begin(), selection.handles().end());
     }
 
     bool enabled_;
@@ -1453,9 +1533,11 @@ private:
     std::vector<Owner> owners_;
     std::vector<Shared> shared_;
     std::vector<WaitingSource> waiting_;
-    static constexpr std::size_t kDemandCapacity = 256;
-    std::vector<Demand> demand_;
-    std::uint64_t clock_   = 0;
-    std::uint64_t ordinal_ = 0;
+    std::size_t demand_capacity_ = 256;
+    std::list<Demand> demand_;
+    std::map<DemandKey, typename std::list<Demand>::iterator> demand_lookup_;
+    std::uint64_t request_epoch_   = 0;
+    std::uint64_t retention_clock_ = 0;
+    std::uint64_t ordinal_         = 0;
 };
 } // namespace ninfer::runtime
